@@ -1,0 +1,70 @@
+/* Slop Guard — uses SillyTavern theme variables so it follows any theme */
+
+.sg_settings .sg_version { opacity: 0.6; font-weight: normal; }
+.sg_settings .sg_note,
+.sg_review .sg_note { display: block; opacity: 0.7; margin: 4px 0 8px; }
+
+.sg_row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin: 4px 0;
+}
+.sg_row > .text_pole { flex: 1 1 120px; min-width: 0; margin: 0; }
+.sg_row > .checkbox_label { flex: 0 0 auto; }
+.sg_row .sg_num { flex: 0 0 70px; }
+
+.sg_buttons { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.sg_buttons .menu_button { width: auto; margin: 0; }
+.sg_buttons .menu_button.disabled { opacity: 0.5; pointer-events: none; }
+
+.sg_rules { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
+
+.sg_rule {
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 8px;
+    padding: 6px 8px;
+}
+.sg_rule.sg_off { opacity: 0.5; }
+.sg_rule textarea { width: 100%; box-sizing: border-box; margin: 4px 0 0; resize: vertical; }
+
+.sg_rule_head,
+.sg_review_head { display: flex; align-items: center; gap: 6px; }
+.sg_rule_head .sg_f_find,
+.sg_review_head .sg_f_find { flex: 1 1 auto; min-width: 0; margin: 0; }
+.sg_rule_head .sg_f_delete { width: auto; margin: 0; padding: 5px 8px; }
+.sg_invalid { outline: 1px solid #e05555; }
+
+/* Review / scan popups */
+.sg_review { text-align: left; }
+.sg_review h3 { margin: 0 0 4px; }
+.sg_review_rule {
+    display: block;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 8px;
+    padding: 6px 8px;
+    margin: 6px 0;
+}
+.sg_review_rule textarea { width: 100%; box-sizing: border-box; margin: 4px 0 0; resize: vertical; }
+.sg_review_head code { overflow-wrap: anywhere; }
+.sg_badge {
+    margin-left: auto;
+    flex: 0 0 auto;
+    font-size: 0.85em;
+    opacity: 0.75;
+}
+.sg_sample {
+    font-size: 0.9em;
+    opacity: 0.9;
+    margin: 4px 0 0 22px;
+    overflow-wrap: anywhere;
+}
+.sg_sample del {
+    color: #e05555;
+    text-decoration: line-through;
+}
+.sg_sample ins {
+    color: #4caf7a;
+    text-decoration: underline;
+}
