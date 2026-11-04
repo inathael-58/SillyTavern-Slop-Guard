@@ -68,3 +68,9 @@
     color: #4caf7a;
     text-decoration: underline;
 }
+
+/* version check + hard refresh */
+.sg_verline { font-size: 0.9em; opacity: 0.85; margin: 2px 0 6px; }
+.sg_verbtns { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.sg_verbtns .menu_button { width: auto; margin: 0; font-size: 0.95em; }
+.sg_stale { color: #f5a524; font-weight: 600; }
