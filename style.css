@@ -86,3 +86,5 @@
 /* keep the shared Extensions column from growing on phones */
 .sg_settings { contain: inline-size; max-width: 100%; overflow-wrap: anywhere; }
 .sg_row > select.text_pole { flex: 1 1 0; width: 0; min-width: 0; margin: 0; }
+.sg_pool_hint[hidden] { display: none; }
+.sg_pool_hint { color: #f5a524; opacity: 0.9; margin: 2px 0 0; }

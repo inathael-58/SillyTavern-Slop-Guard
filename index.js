@@ -54,7 +54,8 @@ const SEED_RULES = [
     },
     {
         find: 'อย่างสมบูรณ์แบบ',
-        pool: ['พอดิบพอดี', 'อย่างเหมาะเจาะ', 'ราวกับสร้างมาคู่กัน', 'ราวกับเกิดมาเพื่อกันและกัน', 'อย่างลงตัว'],
+        pool: ['พอดิบพอดี', 'อย่างเหมาะเจาะ', 'ราวกับสร้างมาคู่กัน', 'ราวกับเกิดมาเพื่อกันและกัน', 'อย่างลงตัว',
+            'อย่างกลมกลืน', 'อย่างไม่มีที่ติ', 'จนแทบไม่น่าเชื่อ', 'ราวกับเป็นชิ้นส่วนเดียวกัน', 'อย่างไร้รอยต่อ'],
         models: '',
         prompt: '',
     },
@@ -177,6 +178,14 @@ function compile(rule) {
 }
 
 const pickRandom = arr => arr[Math.floor(Math.random() * arr.length)];
+function pickWeighted(arr, weight) {
+    const w = arr.map(weight);
+    let r = Math.random() * w.reduce((a, b) => a + b, 0);
+    for (let i = 0; i < arr.length; i++) if ((r -= w[i]) < 0) return arr[i];
+    return arr[arr.length - 1];
+}
+/** Below this many alternatives off cooldown, some cooling ones are allowed back so the order stays unpredictable. */
+const MIN_CHOICES = 3;
 
 /** What to look for in the chat to tell whether an alternative was used: its text without $1-style references. */
 const fingerprint = v => v.replace(/\$(?:\d{1,2}|&|<[^>]*>)/g, '').trim().toLowerCase();
@@ -200,17 +209,25 @@ function rotation(rule, rx, text, history) {
         const age = !fp ? Infinity : textLower.includes(fp) ? 0 : ageIn((_, l) => l.includes(fp));
         return { v, age };
     });
+    const window = history.length + 1;
     return {
         /** @returns {string|null} a replacement template, or null to leave this occurrence alone */
         next() {
             if (originalFree) { originalFree = false; return null; }
+            // Off cooldown: equally likely. When fewer than MIN_CHOICES are off cooldown
+            // (small pool, or the phrase keeps coming back), the ones cooling longest
+            // join in with a smaller chance. A hard cooldown on a small pool would
+            // otherwise leave exactly one option each time and repeat in a fixed order.
+            // Never this reply's or the previous reply's word, while anything else is left.
             const free = vars.filter(x => x.age === Infinity);
             let pick;
-            if (free.length) pick = pickRandom(free);
+            if (free.length >= MIN_CHOICES) pick = pickRandom(free);
             else {
-                // everything is cooling: take whatever was used longest ago
-                const oldest = Math.max(...vars.map(x => x.age));
-                pick = pickRandom(vars.filter(x => x.age === oldest));
+                const cooled = n => vars.filter(x => x.age === n || (n === 2 && x.age >= 2 && x.age !== Infinity));
+                const options = [...free, ...cooled(2)];
+                if (options.length < MIN_CHOICES) options.push(...cooled(1)); // the previous reply's words
+                if (!options.length) options.push(...cooled(0)); // only this reply's words are left
+                pick = pickWeighted(options, x => x.age === Infinity ? 1 : (x.age + 1) / (window + 1));
             }
             pick.age = 0;
             return pick.v;
@@ -835,7 +852,7 @@ function renderSettings() {
     $id('sg_role').addEventListener('change', e => { s.role = Number(e.target.value); save(); });
     $id('sg_depth').addEventListener('change', e => { s.depth = Math.max(0, Number(e.target.value) || 0); save(); });
     $id('sg_scan_count').addEventListener('change', e => { s.scanCount = Math.max(5, Number(e.target.value) || 30); save(); });
-    $id('sg_cooldown').addEventListener('change', e => { s.cooldown = Math.max(1, Number(e.target.value) || DEFAULTS.cooldown); e.target.value = String(s.cooldown); save(); });
+    $id('sg_cooldown').addEventListener('change', e => { s.cooldown = Math.max(1, Number(e.target.value) || DEFAULTS.cooldown); e.target.value = String(s.cooldown); save(); renderRules(); });
 
     $id('sg_add').addEventListener('click', () => {
         s.rules.unshift(makeRule());
@@ -881,6 +898,15 @@ function syncModelLine() {
         : 'ยังไม่ได้เชื่อมต่อโมเดล';
 }
 
+/** Pools smaller than this let alternatives come back before the cooldown ends. */
+const poolTarget = () => 2 * Math.max(1, Number(settings().cooldown) || DEFAULTS.cooldown);
+
+function poolHint(rule) {
+    const n = rule.pool.length;
+    const want = poolTarget();
+    return n && n < want ? `คลังมี ${n} คำ ถ้าคำนี้โผล่บ่อย คำในคลังจะวนกลับมาก่อนหมดคูลดาวน์ ควรมีอย่างน้อย ${want} คำ` : '';
+}
+
 function renderRules() {
     const box = $id('sg_rules');
     if (!box) return;
@@ -903,6 +929,7 @@ function renderRules() {
                 <input type="text" class="text_pole sg_f_models" placeholder="ทุกโมเดล" title="โมเดลที่จะได้กฎใน prompt" value="${esc(r.models)}">
             </div>
             <textarea class="text_pole sg_f_pool" rows="${Math.min(5, Math.max(2, r.pool.length))}" placeholder="คำหลากคำ บรรทัดละคำ (ว่าง = ใช้ช่องแทนด้วย)">${esc(r.pool.join('\n'))}</textarea>
+            <small class="sg_note sg_pool_hint"${poolHint(r) ? '' : ' hidden'}>${esc(poolHint(r))}</small>
             <div class="sg_row sg_pool_row">
                 <label class="checkbox_label" title="คำเดิมผ่านได้หนึ่งครั้ง แล้วติดคูลดาวน์ ไม่ติ๊ก = แทนทุกครั้ง"><input type="checkbox" class="sg_f_allow" ${r.allowFirst ? 'checked' : ''}> ให้คำเดิมผ่านครั้งแรก</label>
                 <div class="menu_button menu_button_icon sg_f_suggest" title="ให้โมเดลที่ใช้อยู่ช่วยคิดคำความหมายเดียวกัน"><i class="fa-solid fa-wand-magic-sparkles"></i> AI ช่วยคิดคำ</div>
@@ -915,7 +942,12 @@ function renderRules() {
         const field = (cls, key, prop = 'value') => el.querySelector(cls).addEventListener('change', e => {
             rule[key] = key === 'pool' ? parsePool(e.target.value) : e.target[prop];
             if (key === 'enabled') el.classList.toggle('sg_off', !rule.enabled);
-            if (key === 'pool') el.querySelector('.sg_f_replace').classList.toggle('sg_unused', hasPool(rule));
+            if (key === 'pool') {
+                el.querySelector('.sg_f_replace').classList.toggle('sg_unused', hasPool(rule));
+                const hint = el.querySelector('.sg_pool_hint');
+                hint.textContent = poolHint(rule);
+                hint.hidden = !hint.textContent;
+            }
             if (key === 'find' || key === 'replace' || key === 'pool') {
                 el.querySelector('.sg_f_find').classList.toggle('sg_invalid', !!rule.find.trim() && !compile(rule));
             }
