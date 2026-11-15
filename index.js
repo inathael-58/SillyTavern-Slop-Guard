@@ -10,14 +10,20 @@
  *   • Removal — when a reply arrives, matches are replaced or deleted in the
  *     saved message itself (after a confirmation popup, or automatically), so
  *     the phrase never lands in the history the model reads back.
+ *   • Variety — a rule can instead carry a pool of alternatives. The phrase may
+ *     appear once, then goes on cooldown; while it cools, each new occurrence is
+ *     swapped for a random alternative that is not cooling itself, and that
+ *     alternative goes on cooldown in turn. Cooldown is read from the chat
+ *     itself (did it appear in the last N bot replies?), so swipes, edits and
+ *     deleted messages are always accounted for.
  * A scan asks the current model to find repeated phrases in the chat and
- * offers them as new rules.
+ * offers them as new rules; the model can also suggest alternatives for a pool.
  */
 
 const MODULE = 'slop_guard';
 const PROMPT_KEY = 'slop_guard';
 const LOG = '[SlopGuard]';
-const VERSION = '1.0.1'; // keep in sync with manifest.json
+const VERSION = '1.1.0'; // keep in sync with manifest.json
 
 const IN_CHAT = 1; // extension_prompt_types.IN_CHAT
 
@@ -30,6 +36,7 @@ const DEFAULTS = Object.freeze({
     header: '[สไตล์การเขียน]',
     scanCount: 30,
     scanSameModel: true,
+    cooldown: 5, // bot replies a phrase or alternative stays "used" for
 });
 
 const SEED_RULES = [
@@ -44,6 +51,13 @@ const SEED_RULES = [
         replace: '$1',
         models: 'deepseek',
         prompt: 'ห้ามใช้ "หัวเราะแห้งแล้ง" ถ้าตัวละครหัวเราะแบบฝืน ให้แสดงผ่านสิ่งที่ทำต่อ เช่น เบือนหน้า พูดเปลี่ยนเรื่อง หรือเสียงที่ขาดห้วน',
+    },
+    {
+        find: 'อย่างสมบูรณ์แบบ',
+        pool: ['พอดิบพอดี', 'อย่างเหมาะเจาะ', 'ราวกับสร้างมาคู่กัน', 'ราวกับเกิดมาเพื่อกันและกัน', 'อย่างลงตัว',
+            'อย่างกลมกลืน', 'อย่างไม่มีที่ติ', 'จนแทบไม่น่าเชื่อ', 'ราวกับเป็นชิ้นส่วนเดียวกัน', 'อย่างไร้รอยต่อ'],
+        models: '',
+        prompt: '',
     },
 ];
 
@@ -73,8 +87,23 @@ function makeRule(r = {}) {
         remove: r.remove !== false,
         models: String(r.models ?? ''),
         prompt: String(r.prompt ?? ''),
+        pool: parsePool(r.pool),
+        allowFirst: r.allowFirst !== false, // with a pool: the phrase itself may appear once per cooldown
     };
 }
+
+/** A pool is stored as an array; the UI edits it as one alternative per line. */
+function parsePool(v) {
+    const list = Array.isArray(v) ? v : String(v ?? '').split('\n');
+    const out = [];
+    for (const x of list) {
+        const t = String(x ?? '').trim();
+        if (t && !out.includes(t)) out.push(t);
+    }
+    return out;
+}
+
+const hasPool = r => r.pool?.length > 0;
 
 function settings() {
     const ext = ctx().extensionSettings;
@@ -118,15 +147,18 @@ function modelMatches(rule, model) {
 
 // ---------------------------------------------------------------- matching
 
-const compiled = new Map(); // `${find}\u0000${replace}` -> RegExp | null
+const compiled = new Map(); // `${find}\u0000${deletes}` -> RegExp | null
+
+/** A literal phrase that is deleted outright takes one space before it along. */
+const deletes = rule => rule.replace === '' && !hasPool(rule);
 
 /**
  * "/body/flags" is a regex (g is always added). Anything else is a literal phrase;
- * when it is deleted (empty replacement) one space before it goes too, so
+ * when it is deleted (empty replacement, no pool) one space before it goes too, so
  * "held her possessively close" becomes "held her close".
  */
 function compile(rule) {
-    const key = `${rule.find}\u0000${rule.replace}`;
+    const key = `${rule.find}\u0000${deletes(rule) ? 1 : 0}`;
     if (compiled.has(key)) return compiled.get(key);
     let rx = null;
     const m = rule.find.match(/^\/([\s\S]+)\/([dgimsuvy]*)$/);
@@ -135,7 +167,7 @@ function compile(rule) {
             rx = new RegExp(m[1], m[2].includes('g') ? m[2] : m[2] + 'g');
         } else if (rule.find.trim()) {
             const body = escapeRegex(rule.find.trim());
-            rx = new RegExp(rule.replace === '' ? `[ \\t]?${body}` : body, 'g');
+            rx = new RegExp(deletes(rule) ? `[ \\t]?${body}` : body, 'g');
         }
     } catch (e) {
         console.warn(LOG, 'invalid pattern', rule.find, e);
@@ -145,30 +177,119 @@ function compile(rule) {
     return rx;
 }
 
-/** @returns {{rule, matches: {index:number, text:string, after:string}[]}[]} */
-function findHits(text, rules) {
-    const hits = [];
+const pickRandom = arr => arr[Math.floor(Math.random() * arr.length)];
+function pickWeighted(arr, weight) {
+    const w = arr.map(weight);
+    let r = Math.random() * w.reduce((a, b) => a + b, 0);
+    for (let i = 0; i < arr.length; i++) if ((r -= w[i]) < 0) return arr[i];
+    return arr[arr.length - 1];
+}
+/** Below this many alternatives off cooldown, some cooling ones are allowed back so the order stays unpredictable. */
+const MIN_CHOICES = 3;
+
+/** What to look for in the chat to tell whether an alternative was used: its text without $1-style references. */
+const fingerprint = v => v.replace(/\$(?:\d{1,2}|&|<[^>]*>)/g, '').trim().toLowerCase();
+
+/**
+ * Hands out replacements for one pool rule across one reply.
+ * Age of a phrase = how many bot replies back it last appeared (0 = this reply,
+ * Infinity = not within the cooldown window, i.e. free to use).
+ */
+function rotation(rule, rx, text, history) {
+    const test = new RegExp(rx.source, rx.flags.replace('g', ''));
+    const lower = history.map(h => h.toLowerCase());
+    const ageIn = has => {
+        for (let k = 1; k <= history.length; k++) if (has(history[history.length - k], lower[lower.length - k])) return k;
+        return Infinity;
+    };
+    let originalFree = rule.allowFirst && ageIn(h => test.test(h)) === Infinity;
+    const textLower = text.toLowerCase();
+    const vars = rule.pool.map(v => {
+        const fp = fingerprint(v);
+        const age = !fp ? Infinity : textLower.includes(fp) ? 0 : ageIn((_, l) => l.includes(fp));
+        return { v, age };
+    });
+    const window = history.length + 1;
+    return {
+        /** @returns {string|null} a replacement template, or null to leave this occurrence alone */
+        next() {
+            if (originalFree) { originalFree = false; return null; }
+            // Off cooldown: equally likely. When fewer than MIN_CHOICES are off cooldown
+            // (small pool, or the phrase keeps coming back), the ones cooling longest
+            // join in with a smaller chance. A hard cooldown on a small pool would
+            // otherwise leave exactly one option each time and repeat in a fixed order.
+            // Never this reply's or the previous reply's word, while anything else is left.
+            const free = vars.filter(x => x.age === Infinity);
+            let pick;
+            if (free.length >= MIN_CHOICES) pick = pickRandom(free);
+            else {
+                const cooled = n => vars.filter(x => x.age === n || (n === 2 && x.age >= 2 && x.age !== Infinity));
+                const options = [...free, ...cooled(2)];
+                if (options.length < MIN_CHOICES) options.push(...cooled(1)); // the previous reply's words
+                if (!options.length) options.push(...cooled(0)); // only this reply's words are left
+                pick = pickWeighted(options, x => x.age === Infinity ? 1 : (x.age + 1) / (window + 1));
+            }
+            pick.age = 0;
+            return pick.v;
+        },
+    };
+}
+
+/**
+ * Works out every change the rules make to a reply, without making it.
+ * @param {string} text
+ * @param {any[]} rules
+ * @param {string[]} history — earlier bot replies, oldest first, within the cooldown window
+ * @returns {{rule, index:number, text:string, after:string}[]} non-overlapping, in text order
+ */
+function planEdits(text, rules, history = []) {
+    const edits = [];
     for (const rule of rules) {
         const rx = compile(rule);
         if (!rx) continue;
-        const matches = [];
         const single = new RegExp(rx.source, rx.flags.replace('g', ''));
+        const rot = hasPool(rule) ? rotation(rule, rx, text, history) : null;
         for (const m of text.matchAll(rx)) {
             if (!m[0]) continue;
-            matches.push({ index: m.index, text: m[0], after: m[0].replace(single, rule.replace) });
+            const template = rot ? rot.next() : rule.replace;
+            if (template === null) continue;
+            const after = m[0].replace(single, template);
+            if (after !== m[0]) edits.push({ rule, index: m.index, text: m[0], after });
         }
-        if (matches.length) hits.push({ rule, matches });
     }
-    return hits;
-}
-
-function applyRules(text, rules) {
-    let out = text;
-    for (const rule of rules) {
-        const rx = compile(rule);
-        if (rx) out = out.replace(rx, rule.replace);
+    // Stable sort keeps rule order for edits at the same spot; the first one wins.
+    edits.sort((a, b) => a.index - b.index);
+    const out = [];
+    let end = -1;
+    for (const e of edits) {
+        if (e.index < end) continue;
+        out.push(e);
+        end = e.index + e.text.length;
     }
     return out;
+}
+
+function applyEdits(text, edits) {
+    let out = text;
+    for (let i = edits.length - 1; i >= 0; i--) {
+        const e = edits[i];
+        out = out.slice(0, e.index) + e.after + out.slice(e.index + e.text.length);
+    }
+    return out;
+}
+
+const isBotMessage = m => m && !m.is_user && !m.is_system && typeof m.mes === 'string';
+
+/** Texts of the bot replies before `id`, oldest first, as many as the cooldown covers. */
+function historyBefore(id, texts = null) {
+    const c = ctx();
+    const n = Math.max(0, Number(settings().cooldown) || 0);
+    const out = [];
+    for (let i = id - 1; i >= 0 && out.length < n; i--) {
+        if (!isBotMessage(c.chat[i])) continue;
+        out.push(texts?.get(i) ?? c.chat[i].mes);
+    }
+    return out.reverse();
 }
 
 const removalRules = () => settings().rules.filter(r => r.enabled && r.remove && r.find.trim());
@@ -203,7 +324,7 @@ function snippet(text, m) {
 
 /**
  * Asks which rules to apply.
- * @param {{id:number, text:string, hits:any[]}[]} found
+ * @param {{id:number, text:string, edits:any[]}[]} found
  * @param {boolean} single — a fresh reply (offers "always remove")
  * @returns {Promise<{ruleIds:Set<string>, always:boolean}|null>}
  */
@@ -211,12 +332,13 @@ async function reviewPopup(found, single) {
     const c = ctx();
     const byRule = new Map();
     for (const f of found) {
-        for (const h of f.hits) {
-            if (!byRule.has(h.rule.id)) byRule.set(h.rule.id, { rule: h.rule, count: 0, messages: 0, samples: [] });
-            const g = byRule.get(h.rule.id);
-            g.count += h.matches.length;
-            g.messages += 1;
-            for (const m of h.matches) if (g.samples.length < 3) g.samples.push(snippet(f.text, m));
+        const seen = new Set();
+        for (const e of f.edits) {
+            if (!byRule.has(e.rule.id)) byRule.set(e.rule.id, { rule: e.rule, count: 0, messages: 0, samples: [] });
+            const g = byRule.get(e.rule.id);
+            g.count += 1;
+            if (!seen.has(e.rule.id)) { seen.add(e.rule.id); g.messages += 1; }
+            if (g.samples.length < 3) g.samples.push(snippet(f.text, e));
         }
     }
 
@@ -231,7 +353,7 @@ async function reviewPopup(found, single) {
             <div class="sg_review_head">
                 <input type="checkbox" data-rule="${esc(g.rule.id)}" checked>
                 <code>${esc(g.rule.find)}</code>
-                <span class="sg_badge">${g.count} ครั้ง${single ? '' : ` · ${g.messages} ข้อความ`}</span>
+                <span class="sg_badge">${hasPool(g.rule) ? 'หลากคำ · ' : ''}${g.count} ครั้ง${single ? '' : ` · ${g.messages} ข้อความ`}</span>
             </div>
             ${g.samples.map(x => `<div class="sg_sample">${x}</div>`).join('')}
         </label>`).join('')}`;
@@ -264,8 +386,6 @@ function writeMessage(id, text) {
     c.eventSource.emit(c.eventTypes.MESSAGE_UPDATED, id);
 }
 
-const isBotMessage = m => m && !m.is_user && !m.is_system && typeof m.mes === 'string';
-
 // Popups for incoming replies are shown one at a time, and the event handler
 // never waits on them — SillyTavern awaits MESSAGE_RECEIVED before finishing a
 // generation, and a popup left open must not hold that up.
@@ -286,13 +406,11 @@ async function handleReply(id) {
     const msg = c.chat[id];
     if (!isBotMessage(msg)) return;
     const text = msg.mes;
-    const rules = removalRules();
-    const hits = findHits(text, rules);
-    if (!hits.length) return;
+    let edits = planEdits(text, removalRules(), historyBefore(id));
+    if (!edits.length) return;
 
-    let chosen = hits.map(h => h.rule);
     if (s.mode === 'ask') {
-        const answer = await reviewPopup([{ id, text, hits }], true);
+        const answer = await reviewPopup([{ id, text, edits }], true);
         if (!answer) return;
         if (answer.always) {
             s.mode = 'auto';
@@ -300,23 +418,20 @@ async function handleReply(id) {
             syncSettingsUi();
             toast.info('ต่อจากนี้จะลบอัตโนมัติ เปลี่ยนกลับได้ในหน้าตั้งค่า Slop Guard');
         }
-        chosen = chosen.filter(r => answer.ruleIds.has(r.id));
+        edits = edits.filter(e => answer.ruleIds.has(e.rule.id));
         // The user may have swiped, edited or deleted while the popup was open.
         if (ctx().chat[id] !== msg || msg.mes !== text) {
             toast.warn('ข้อความเปลี่ยนไประหว่างรอ เลยไม่ได้แก้ให้');
             return;
         }
     }
-    if (!chosen.length) return;
+    if (!edits.length) return;
 
-    const out = applyRules(text, chosen);
+    const out = applyEdits(text, edits);
     if (out === text) return;
     writeMessage(id, out);
     await c.saveChat();
-    if (s.mode === 'auto') {
-        const n = hits.filter(h => chosen.includes(h.rule)).reduce((a, h) => a + h.matches.length, 0);
-        toast.info(`ลบ/แทนที่ ${n} จุดในข้อความล่าสุด`);
-    }
+    if (s.mode === 'auto') toast.info(`ลบ/แทนที่ ${edits.length} จุดในข้อความล่าสุด`);
 }
 
 async function cleanWholeChat() {
@@ -324,20 +439,24 @@ async function cleanWholeChat() {
     if (!c.chat?.length) return toast.warn('ยังไม่ได้เปิดแชท');
     const rules = removalRules();
     const found = [];
+    // Go oldest to newest, and let each reply's cooldown see the earlier replies
+    // as they will read after cleaning, so alternatives keep rotating.
+    const cleaned = new Map();
     c.chat.forEach((m, id) => {
         if (!isBotMessage(m)) return;
-        const hits = findHits(m.mes, rules);
-        if (hits.length) found.push({ id, text: m.mes, hits });
+        const edits = planEdits(m.mes, rules, historyBefore(id, cleaned));
+        if (!edits.length) return;
+        found.push({ id, text: m.mes, edits });
+        cleaned.set(id, applyEdits(m.mes, edits));
     });
     if (!found.length) return toast.ok('ไม่เจอคำที่แบนไว้ในแชทนี้');
 
     const answer = await reviewPopup(found, false);
     if (!answer) return;
-    const chosen = rules.filter(r => answer.ruleIds.has(r.id));
     let changed = 0;
     for (const f of found) {
         if (c.chat[f.id]?.mes !== f.text) continue;
-        const out = applyRules(f.text, chosen);
+        const out = applyEdits(f.text, f.edits.filter(e => answer.ruleIds.has(e.rule.id)));
         if (out !== f.text) { writeMessage(f.id, out); changed++; }
     }
     if (changed) await c.saveChat();
@@ -350,8 +469,9 @@ const SCAN_SYSTEM = `You are an editor hunting a writer's verbal tics.
 Read the passages and list up to 8 phrases that occur at least twice and read as clichés or crutches (stock gestures, stock adverbs, stock metaphors).
 For each, copy the phrase EXACTLY as it is written in the text — same language, same spelling — and as short as possible while still identifying the tic.
 Return ONLY a JSON array, no prose:
-[{"phrase": "...", "fix": "...", "rule": "..."}]
+[{"phrase": "...", "fix": "...", "alts": ["...", "..."], "rule": "..."}]
 - "fix": text that can replace the phrase everywhere and still read naturally; "" if deleting the phrase leaves a correct sentence; null if no single replacement works.
+- "alts": 3-6 fresh alternatives with the same meaning that fit the same slot in the sentence (same language, same grammatical role), so they can be rotated in place of the phrase; [] if the phrase should simply go.
 - "rule": one short instruction in the same language as the passages telling the writer what to do instead. Describe the alternative; mention the phrase at most once.`;
 
 function stripForScan(text) {
@@ -404,7 +524,7 @@ async function scanWithAI() {
         raw = await c.generateRaw({
             systemPrompt: SCAN_SYSTEM,
             prompt: `<passages>\n${corpus}\n</passages>\n\nReturn the JSON array now.`,
-            responseLength: 1500,
+            responseLength: 2500,
         });
     } catch (e) {
         console.error(LOG, e);
@@ -427,7 +547,9 @@ async function scanWithAI() {
         const count = (corpus.match(new RegExp(escapeRegex(phrase), 'gi')) ?? []).length;
         if (count < 2) continue;
         if (existing.some(rx => { rx.lastIndex = 0; return rx.test(phrase); })) continue;
-        items.push({ phrase, count, fix: typeof x.fix === 'string' ? x.fix : null, rule: String(x.rule ?? '') });
+        const alts = parsePool(Array.isArray(x.alts) ? x.alts.filter(a => typeof a === 'string') : [])
+            .filter(a => a.toLowerCase() !== key);
+        items.push({ phrase, count, fix: typeof x.fix === 'string' ? x.fix : null, alts, rule: String(x.rule ?? '') });
     }
     if (!items.length) return toast.ok('ไม่เจอวลีซ้ำใหม่ (หรือมีกฎครอบไว้แล้ว)');
     await addScanResults(items, family);
@@ -439,7 +561,7 @@ async function addScanResults(items, family) {
     root.className = 'sg_review';
     root.innerHTML = `
         <h3>วลีที่เจอซ้ำ</h3>
-        <small class="sg_note">ติ๊กอันที่จะเพิ่มเป็นกฎ แก้ไขได้ก่อนกดเพิ่ม · ถ้าไม่ติ๊ก "ลบในข้อความ" กฎจะใช้แค่ใน prompt</small>
+        <small class="sg_note">ติ๊กอันที่จะเพิ่มเป็นกฎ แก้ไขได้ก่อนกดเพิ่ม · ถ้าไม่ติ๊ก "ลบในข้อความ" กฎจะใช้แค่ใน prompt · ช่อง "คำหลากคำ" ถ้ามีคำ ระบบจะสุ่มคำในนั้นมาแทนแทนการลบ (ลบบรรทัดออกให้หมดถ้าอยากลบทิ้งเฉยๆ)</small>
         ${items.map((it, i) => `
         <div class="sg_review_rule" data-i="${i}">
             <div class="sg_review_head">
@@ -452,6 +574,7 @@ async function addScanResults(items, family) {
                 <input type="text" class="text_pole sg_f_replace" placeholder="แทนด้วย (ว่าง = ลบ)" value="${esc(it.fix ?? '')}">
                 <input type="text" class="text_pole sg_f_models" placeholder="ทุกโมเดล" value="${esc(family)}">
             </div>
+            <textarea class="text_pole sg_f_pool" rows="3" placeholder="คำหลากคำ หนึ่งคำต่อบรรทัด">${esc(it.alts.join('\n'))}</textarea>
             <textarea class="text_pole sg_f_prompt" rows="2" placeholder="กฎใน prompt">${esc(it.rule)}</textarea>
         </div>`).join('')}`;
     const result = await c.callGenericPopup(root, c.POPUP_TYPE.CONFIRM, '', {
@@ -471,9 +594,10 @@ async function addScanResults(items, family) {
         s.rules.push(makeRule({
             find,
             replace: el.querySelector('.sg_f_replace').value,
-            remove: el.querySelector('.sg_f_remove').checked,
+            remove: el.querySelector('.sg_f_remove').checked || !!el.querySelector('.sg_f_pool').value.trim(),
             models: el.querySelector('.sg_f_models').value.trim(),
             prompt: el.querySelector('.sg_f_prompt').value.trim(),
+            pool: el.querySelector('.sg_f_pool').value,
         }));
         added++;
     }
@@ -481,6 +605,142 @@ async function addScanResults(items, family) {
     save();
     renderRules();
     toast.ok(`เพิ่ม ${added} กฎ`);
+}
+
+// ---------------------------------------------------------------- AI: alternatives for a pool
+
+const POOL_SYSTEM = `You help a fiction writer vary a phrase they overuse.
+You get the phrase and some sentences where it appears. Suggest up to 10 alternatives that keep the meaning and fit the SAME slot, so that putting any of them in place of the phrase leaves a natural, grammatical sentence.
+- Write in the same language as the phrase.
+- Keep the grammatical role: an adverb for an adverb, a clause for a clause, a verb phrase for a verb phrase.
+- Each alternative replaces the whole quoted phrase.
+- Make them genuinely different from one another in wording and imagery. Avoid near-duplicates, and avoid alternatives that are worn-out clichés themselves.
+Return ONLY a JSON array of strings, no prose.`;
+
+/** Up to `max` places in the chat where the rule matches, with some text around each. */
+function sampleContexts(rule, max = 5) {
+    const rx = compile(rule);
+    const c = ctx();
+    if (!rx || !c.chat?.length) return [];
+    const out = [];
+    for (let i = c.chat.length - 1; i >= 0 && out.length < max; i--) {
+        const m = c.chat[i];
+        if (!isBotMessage(m)) continue;
+        const text = stripForScan(m.mes);
+        for (const hit of text.matchAll(rx)) {
+            if (!hit[0] || out.length >= max) continue;
+            const start = Math.max(0, hit.index - 70);
+            const end = Math.min(text.length, hit.index + hit[0].length + 70);
+            out.push({
+                match: hit[0],
+                before: text.slice(start, hit.index).replace(/\s+/g, ' '),
+                after: text.slice(hit.index + hit[0].length, end).replace(/\s+/g, ' '),
+            });
+        }
+    }
+    return out;
+}
+
+function parseStringList(raw) {
+    const text = String(raw ?? '').replace(/<(think|thinking)>[\s\S]*?<\/\1>/gi, '');
+    const a = text.indexOf('[');
+    const b = text.lastIndexOf(']');
+    if (a < 0 || b <= a) return [];
+    try {
+        const arr = JSON.parse(text.slice(a, b + 1));
+        if (!Array.isArray(arr)) return [];
+        return arr.map(x => typeof x === 'string' ? x : x?.phrase ?? x?.text ?? '').filter(x => typeof x === 'string');
+    } catch {
+        console.warn(LOG, 'pool suggestions are not JSON', text);
+        return [];
+    }
+}
+
+const suggesting = new Set(); // rule ids with a request in flight
+
+/** Asks the current model for alternatives to a rule's phrase and lets the user pick which go into its pool. */
+async function suggestPool(rule, button) {
+    if (suggesting.has(rule.id)) return;
+    if (!rule.find.trim()) return toast.warn('ใส่คำในช่อง "หา" ก่อน');
+    const c = ctx();
+    const isRegex = /^\/[\s\S]+\/[dgimsuvy]*$/.test(rule.find);
+    const samples = sampleContexts(rule);
+    const phrase = (samples[0]?.match ?? rule.find).trim();
+    if (isRegex && !samples.length) return toast.warn('กฎนี้เป็น regex และยังไม่เจอในแชทนี้ เลยไม่รู้ว่าคำจริงคืออะไร ลองเปิดแชทที่มีคำนี้ก่อน');
+
+    const lines = [`Phrase: "${phrase}"`];
+    if (isRegex) lines.push(`(It is one match of the pattern ${rule.find}; alternatives replace the whole match.)`);
+    if (rule.pool.length) lines.push(`Already in the pool, do not repeat: ${rule.pool.map(x => `"${x}"`).join(', ')}`);
+    lines.push(samples.length
+        ? `Sentences where it appears (the phrase is between ⟦ ⟧):\n${samples.map(x => `- …${x.before}⟦${x.match}⟧${x.after}…`).join('\n')}`
+        : 'No example sentences are available; assume ordinary narrative prose.');
+    lines.push('', 'Return the JSON array now.');
+
+    suggesting.add(rule.id);
+    const icon = button?.querySelector('i');
+    button?.classList.add('disabled');
+    icon?.classList.replace('fa-wand-magic-sparkles', 'fa-spinner');
+    icon?.classList.add('fa-spin');
+    let raw;
+    try {
+        raw = await c.generateRaw({ systemPrompt: POOL_SYSTEM, prompt: lines.join('\n'), responseLength: 800 });
+    } catch (e) {
+        console.error(LOG, e);
+        return toast.warn('ขอคำจาก AI ไม่สำเร็จ: ' + (e?.message ?? e));
+    } finally {
+        suggesting.delete(rule.id);
+        button?.classList.remove('disabled');
+        icon?.classList.remove('fa-spin');
+        icon?.classList.replace('fa-spinner', 'fa-wand-magic-sparkles');
+    }
+
+    const known = new Set([phrase, ...rule.pool].map(x => x.toLowerCase()));
+    const list = parsePool(parseStringList(raw)).filter(x => !known.has(x.toLowerCase()));
+    if (!list.length) return toast.warn('AI ไม่ได้เสนอคำใหม่ ลองกดอีกครั้ง');
+    await pickPoolSuggestions(rule, list, samples[0] ?? null);
+}
+
+async function pickPoolSuggestions(rule, list, sample) {
+    const c = ctx();
+    const preview = alt => sample
+        ? `…${esc(sample.before)}<ins>${esc(alt)}</ins>${esc(sample.after)}…`
+        : `<ins>${esc(alt)}</ins>`;
+    const root = document.createElement('div');
+    root.className = 'sg_review';
+    root.innerHTML = `
+        <h3>คำหลากคำสำหรับ <code>${esc(sample?.match ?? rule.find)}</code></h3>
+        <small class="sg_note">ติ๊กคำที่จะใส่ในคลัง แก้คำได้ก่อนกดเพิ่ม · ตัวอย่างใต้แต่ละคำคือประโยคจากแชทนี้เมื่อใช้คำนั้นแทน</small>
+        ${list.map((alt, i) => `
+        <div class="sg_review_rule" data-i="${i}">
+            <div class="sg_review_head">
+                <input type="checkbox" class="sg_pick" checked>
+                <input type="text" class="text_pole sg_f_find" value="${esc(alt)}">
+            </div>
+            <div class="sg_sample">${preview(alt)}</div>
+        </div>`).join('')}`;
+    for (const el of root.querySelectorAll('.sg_review_rule')) {
+        const input = el.querySelector('.sg_f_find');
+        input.addEventListener('input', () => { el.querySelector('.sg_sample').innerHTML = preview(input.value); });
+    }
+    const result = await c.callGenericPopup(root, c.POPUP_TYPE.CONFIRM, '', {
+        okButton: 'เพิ่มลงคลัง',
+        cancelButton: 'ยกเลิก',
+        wide: true,
+        allowVerticalScrolling: true,
+    });
+    if (result !== c.POPUP_RESULT.AFFIRMATIVE) return;
+    const picked = [...root.querySelectorAll('.sg_review_rule')]
+        .filter(el => el.querySelector('.sg_pick').checked)
+        .map(el => el.querySelector('.sg_f_find').value);
+    const before = rule.pool.length;
+    rule.pool = parsePool([...rule.pool, ...picked]);
+    const added = rule.pool.length - before;
+    if (!added) return;
+    const turnedOn = !rule.remove;
+    rule.remove = true;
+    save();
+    renderRules();
+    toast.ok(`เพิ่ม ${added} คำลงคลัง${turnedOn ? ' และเปิด "ลบในข้อความ" ให้แล้ว (คลังคำทำงานตอนแก้ข้อความ)' : ''}`);
 }
 
 // ---------------------------------------------------------------- import / export
@@ -538,11 +798,11 @@ function renderSettings() {
                 ${versionLineHtml()}
                 <label class="checkbox_label"><input type="checkbox" id="sg_enabled"> เปิดใช้ Slop Guard</label>
                 <div class="sg_row">
-                    <label for="sg_mode">เจอคำแบนในข้อความใหม่</label>
+                    <label for="sg_mode" title="ไม่ลบ = ใช้แค่กฎใน prompt">เจอคำแบนในข้อความใหม่</label>
                     <select id="sg_mode" class="text_pole">
                         <option value="ask">ถามก่อนลบ (popup)</option>
                         <option value="auto">ลบอัตโนมัติ</option>
-                        <option value="off">ไม่ลบ (ใช้แค่กฎใน prompt)</option>
+                        <option value="off">ไม่ลบ</option>
                     </select>
                 </div>
                 <label class="checkbox_label"><input type="checkbox" id="sg_inject"> ใส่กฎลงใน prompt (เฉพาะกฎของโมเดลที่ใช้อยู่)</label>
@@ -555,6 +815,11 @@ function renderSettings() {
                         <option value="1">User</option>
                         <option value="2">Assistant</option>
                     </select>
+                </div>
+                <div class="sg_row">
+                    <label for="sg_cooldown" title="คำเดิมหรือคำในคลังที่เพิ่งใช้ จะไม่ถูกใช้ซ้ำจนกว่าจะผ่านไปกี่ข้อความของบอท">คูลดาวน์คำหลากคำ</label>
+                    <input type="number" id="sg_cooldown" class="text_pole sg_num" min="1" max="100">
+                    <span>ข้อความ</span>
                 </div>
                 <small class="sg_note" id="sg_model_line"></small>
                 <hr class="sysHR">
@@ -572,7 +837,7 @@ function renderSettings() {
                     <span>ข้อความ</span>
                     <label class="checkbox_label"><input type="checkbox" id="sg_scan_same"> เฉพาะที่โมเดลเดียวกันเขียน</label>
                 </div>
-                <small class="sg_note">ช่อง "หา" ใส่วลีตรงๆ หรือ <code>/regex/</code> · ช่อง "โมเดล" ใส่ชื่อบางส่วนคั่นด้วยจุลภาค เช่น <code>gemini, deepseek</code> เว้นว่าง = ทุกโมเดล · โมเดลมีผลกับกฎใน prompt ส่วนการลบใช้กับทุกโมเดล</small>
+                <small class="sg_note">ช่อง "หา" ใส่วลีตรงๆ หรือ <code>/regex/</code> · ช่อง "โมเดล" ใส่ชื่อบางส่วนคั่นด้วยจุลภาค เช่น <code>gemini, deepseek</code> เว้นว่าง = ทุกโมเดล · โมเดลมีผลกับกฎใน prompt ส่วนการลบใช้กับทุกโมเดล · ช่อง "คำหลากคำ" ใส่คำความหมายเดียวกันบรรทัดละคำ แล้วระบบจะสุ่มมาแทนคำเดิม (คำที่เพิ่งใช้ติดคูลดาวน์) กด <i class="fa-solid fa-wand-magic-sparkles"></i> ให้ AI ช่วยคิดคำ</small>
                 <div id="sg_rules" class="sg_rules"></div>
             </div>
         </div>
@@ -587,6 +852,7 @@ function renderSettings() {
     $id('sg_role').addEventListener('change', e => { s.role = Number(e.target.value); save(); });
     $id('sg_depth').addEventListener('change', e => { s.depth = Math.max(0, Number(e.target.value) || 0); save(); });
     $id('sg_scan_count').addEventListener('change', e => { s.scanCount = Math.max(5, Number(e.target.value) || 30); save(); });
+    $id('sg_cooldown').addEventListener('change', e => { s.cooldown = Math.max(1, Number(e.target.value) || DEFAULTS.cooldown); e.target.value = String(s.cooldown); save(); renderRules(); });
 
     $id('sg_add').addEventListener('click', () => {
         s.rules.unshift(makeRule());
@@ -618,6 +884,7 @@ function syncSettingsUi() {
     $id('sg_role').value = String(s.role);
     $id('sg_depth').value = String(s.depth);
     $id('sg_scan_count').value = String(s.scanCount);
+    $id('sg_cooldown').value = String(s.cooldown);
     syncModelLine();
 }
 
@@ -629,6 +896,15 @@ function syncModelLine() {
     el.textContent = model
         ? `โมเดลตอนนี้: ${model} · กฎใน prompt ที่ใช้อยู่ ${active} ข้อ`
         : 'ยังไม่ได้เชื่อมต่อโมเดล';
+}
+
+/** Pools smaller than this let alternatives come back before the cooldown ends. */
+const poolTarget = () => 2 * Math.max(1, Number(settings().cooldown) || DEFAULTS.cooldown);
+
+function poolHint(rule) {
+    const n = rule.pool.length;
+    const want = poolTarget();
+    return n && n < want ? `คลังมี ${n} คำ ถ้าคำนี้โผล่บ่อย คำในคลังจะวนกลับมาก่อนหมดคูลดาวน์ ควรมีอย่างน้อย ${want} คำ` : '';
 }
 
 function renderRules() {
@@ -649,8 +925,14 @@ function renderRules() {
             </div>
             <div class="sg_row">
                 <label class="checkbox_label" title="ลบหรือแทนที่ในข้อความที่บอทตอบ"><input type="checkbox" class="sg_f_remove" ${r.remove ? 'checked' : ''}> ลบในข้อความ</label>
-                <input type="text" class="text_pole sg_f_replace" placeholder="แทนด้วย (ว่าง = ลบ)" value="${esc(r.replace)}">
+                <input type="text" class="text_pole sg_f_replace${hasPool(r) ? ' sg_unused' : ''}" placeholder="แทนด้วย (ว่าง = ลบ)" title="ไม่ใช้ถ้ามีคำหลากคำ" value="${esc(r.replace)}">
                 <input type="text" class="text_pole sg_f_models" placeholder="ทุกโมเดล" title="โมเดลที่จะได้กฎใน prompt" value="${esc(r.models)}">
+            </div>
+            <textarea class="text_pole sg_f_pool" rows="${Math.min(5, Math.max(2, r.pool.length))}" placeholder="คำหลากคำ บรรทัดละคำ (ว่าง = ใช้ช่องแทนด้วย)">${esc(r.pool.join('\n'))}</textarea>
+            <small class="sg_note sg_pool_hint"${poolHint(r) ? '' : ' hidden'}>${esc(poolHint(r))}</small>
+            <div class="sg_row sg_pool_row">
+                <label class="checkbox_label" title="คำเดิมผ่านได้หนึ่งครั้ง แล้วติดคูลดาวน์ ไม่ติ๊ก = แทนทุกครั้ง"><input type="checkbox" class="sg_f_allow" ${r.allowFirst ? 'checked' : ''}> ให้คำเดิมผ่านครั้งแรก</label>
+                <div class="menu_button menu_button_icon sg_f_suggest" title="ให้โมเดลที่ใช้อยู่ช่วยคิดคำความหมายเดียวกัน"><i class="fa-solid fa-wand-magic-sparkles"></i> AI ช่วยคิดคำ</div>
             </div>
             <textarea class="text_pole sg_f_prompt" rows="2" placeholder="กฎใน prompt (ว่าง = ไม่ใส่)">${esc(r.prompt)}</textarea>
         </div>`).join('');
@@ -658,9 +940,15 @@ function renderRules() {
     for (const el of box.querySelectorAll('.sg_rule')) {
         const rule = s.rules.find(r => r.id === el.dataset.id);
         const field = (cls, key, prop = 'value') => el.querySelector(cls).addEventListener('change', e => {
-            rule[key] = e.target[prop];
+            rule[key] = key === 'pool' ? parsePool(e.target.value) : e.target[prop];
             if (key === 'enabled') el.classList.toggle('sg_off', !rule.enabled);
-            if (key === 'find' || key === 'replace') {
+            if (key === 'pool') {
+                el.querySelector('.sg_f_replace').classList.toggle('sg_unused', hasPool(rule));
+                const hint = el.querySelector('.sg_pool_hint');
+                hint.textContent = poolHint(rule);
+                hint.hidden = !hint.textContent;
+            }
+            if (key === 'find' || key === 'replace' || key === 'pool') {
                 el.querySelector('.sg_f_find').classList.toggle('sg_invalid', !!rule.find.trim() && !compile(rule));
             }
             save();
@@ -672,6 +960,9 @@ function renderRules() {
         field('.sg_f_replace', 'replace');
         field('.sg_f_models', 'models');
         field('.sg_f_prompt', 'prompt');
+        field('.sg_f_pool', 'pool');
+        field('.sg_f_allow', 'allowFirst', 'checked');
+        el.querySelector('.sg_f_suggest').addEventListener('click', e => suggestPool(rule, e.currentTarget));
         el.querySelector('.sg_f_delete').addEventListener('click', () => {
             s.rules = s.rules.filter(r => r !== rule);
             save();
