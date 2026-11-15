@@ -11,13 +11,20 @@
  *     alternative goes on cooldown in turn. Cooldown is read from the chat
  *     itself (did it appear in the last N bot replies?), so swipes, edits and
  *     deleted messages are always accounted for.
+ *   • flag   — something no fixed replacement can repair (a word in another
+ *     script slipping into Thai prose): point it out, and let the user, or the
+ *     model, rewrite it.
  *   • prompt — leave replies alone; only tell the model.
  * Edits land in the saved message itself (after a confirmation popup, or
  * straight away), so the phrase never reaches the history the model reads back.
  * Any rule can also carry an instruction that is injected at a chat depth, but
  * only while a model the rule is scoped to is selected, so one model never gets
  * shown another model's tics. The injection goes through setExtensionPrompt,
- * so it works with any preset.
+ * so it works with any preset. An instruction can also wait until its phrase
+ * turns up often in the last few replies, so the model is not shown the phrase
+ * while it is not using it. The same goes for replies that keep opening or
+ * closing alike, or keep ending on a question: the warning is only sent while
+ * that is happening.
  * A scan asks the current model to find repeated phrases in the chat and
  * offers them as new rules; the model can also suggest alternatives for a pool.
  */
@@ -25,7 +32,7 @@
 const MODULE = 'slop_guard';
 const PROMPT_KEY = 'slop_guard';
 const LOG = '[SlopGuard]';
-const VERSION = '1.2.0'; // keep in sync with manifest.json
+const VERSION = '1.3.0'; // keep in sync with manifest.json
 
 const IN_CHAT = 1; // extension_prompt_types.IN_CHAT
 
@@ -39,6 +46,9 @@ const DEFAULTS = Object.freeze({
     scanCount: 30,
     scanSameModel: true,
     cooldown: 5, // bot replies a phrase or alternative stays "used" for
+    watchWindow: 6, // bot replies looked at for "often" rules and repeated openings/closings
+    patternMin: 3, // that many alike openings/closings in the window count as a habit
+    patterns: { opening: true, closing: true, question: true },
 });
 
 const SEED_RULES = [
@@ -88,6 +98,7 @@ const toast = {
 const MODES = {
     fix: { label: 'แก้คำผิด', desc: 'คำผิดหรือคำแปลก ลบหรือแทนที่ทุกครั้งที่เจอ' },
     vary: { label: 'หลากคำ', desc: 'คำที่ใช้ได้แต่ใช้ซ้ำ ปล่อยผ่านครั้งแรก แล้วสุ่มคำจากคลังมาแทนระหว่างคูลดาวน์' },
+    flag: { label: 'แจ้งเตือน', desc: 'แก้ด้วยคำตายตัวไม่ได้ เช่น อักษรต่างภาษาหลุด จะแจ้งพร้อมจุดที่เจอ ให้แก้เองหรือให้ AI แก้' },
     prompt: { label: 'แค่ prompt', desc: 'ไม่แก้ข้อความ บอกโมเดลผ่านกฎใน prompt อย่างเดียว' },
 };
 
@@ -96,6 +107,7 @@ function makeRule(r = {}) {
     return {
         id: r.id || newId(),
         enabled: r.enabled !== false,
+        name: String(r.name ?? ''), // optional label, shown above the pattern (ready-made rules have one)
         find: String(r.find ?? ''),
         // Rules saved before 1.2 have no mode: "remove" off meant prompt only, and a pool meant variety.
         mode: MODES[r.mode] ? r.mode : r.remove === false ? 'prompt' : pool.length ? 'vary' : 'fix',
@@ -104,6 +116,8 @@ function makeRule(r = {}) {
         allowFirst: r.allowFirst !== false, // vary: the phrase itself may appear once per cooldown
         models: String(r.models ?? ''),
         prompt: String(r.prompt ?? ''),
+        when: r.when === 'often' ? 'often' : 'always', // when the prompt instruction is sent
+        minHits: Math.max(1, Math.round(Number(r.minHits)) || 2), // "often": this many hits in the watch window
     };
 }
 
@@ -127,7 +141,7 @@ function settings() {
     if (!ext[MODULE]) ext[MODULE] = {};
     const s = ext[MODULE];
     for (const [k, v] of Object.entries(DEFAULTS)) {
-        if (s[k] === undefined) s[k] = v;
+        if (s[k] === undefined) s[k] = typeof v === 'object' ? { ...v } : v;
     }
     if (!Array.isArray(s.rules)) s.rules = SEED_RULES.map(makeRule);
     if (!migrated) {
@@ -322,9 +336,140 @@ function historyBefore(id, texts = null) {
     return out.reverse();
 }
 
-const removalRules = () => settings().rules.filter(r => r.enabled && r.mode !== 'prompt' && r.find.trim());
+const removalRules = () => settings().rules.filter(r => r.enabled && (r.mode === 'fix' || r.mode === 'vary') && r.find.trim());
+const flagRules = () => settings().rules.filter(r => r.enabled && r.mode === 'flag' && r.find.trim());
+
+// ---------------------------------------------------------------- how often (for "often" rules)
+
+const HITS_KEY = 'slop_guard_hits'; // message.extra[HITS_KEY] = { ruleId: matches edited out of this message }
+
+/** Remembers what was edited out of a message, so "often" still counts it. */
+function recordHits(msg, edits) {
+    if (!edits.length) return;
+    msg.extra ??= {};
+    const h = msg.extra[HITS_KEY] ??= {};
+    for (const e of edits) h[e.rule.id] = (h[e.rule.id] ?? 0) + 1;
+}
+
+/** The last `n` bot replies of the open chat, oldest first. */
+function recentReplies(n) {
+    const chat = ctx().chat ?? [];
+    const out = [];
+    for (let i = chat.length - 1; i >= 0 && out.length < n; i--) if (isBotMessage(chat[i])) out.push(chat[i]);
+    return out.reverse();
+}
+
+/** Matches of a rule in these replies, counting the ones already edited out. */
+function countHits(rule, msgs) {
+    const rx = compile(rule);
+    if (!rx) return 0;
+    let n = 0;
+    for (const m of msgs) {
+        for (const x of m.mes.matchAll(rx)) if (x[0]) n++;
+        n += Number(m.extra?.[HITS_KEY]?.[rule.id]) || 0;
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------- repeated openings / closings
+
+/** The text a reader sees, without markup, thinking blocks or quote marks. */
+function plainText(text) {
+    return stripForScan(String(text ?? '')).replace(/[*_~`"“”'‘’「」『』]/g, '').trim();
+}
+
+const MIN_SEG = 12;
+const MAX_SEG = 40;
+
+/** First or last stretch of a reply, cut at a space so it reads as a phrase. */
+function edgeOf(text, which) {
+    const lines = plainText(text).split(/\n+/).map(l => l.trim()).filter(l => /\p{L}/u.test(l));
+    if (!lines.length) return '';
+    if (which === 'start') {
+        const l = lines[0];
+        if (l.length <= MAX_SEG) return l;
+        const cut = l.slice(MIN_SEG, MAX_SEG).search(/\s/);
+        return cut < 0 ? l.slice(0, MAX_SEG) : l.slice(0, MIN_SEG + cut);
+    }
+    const l = lines[lines.length - 1];
+    if (l.length <= MAX_SEG) return l;
+    const tail = l.slice(-MAX_SEG);
+    const cut = tail.slice(0, MAX_SEG - MIN_SEG).search(/\s/);
+    return cut < 0 ? tail : tail.slice(cut + 1);
+}
+
+function bigrams(s) {
+    const t = s.toLowerCase().replace(/\s+/g, ' ');
+    const out = new Map();
+    for (let i = 0; i < t.length - 1; i++) {
+        const g = t.slice(i, i + 2);
+        out.set(g, (out.get(g) ?? 0) + 1);
+    }
+    return out;
+}
+
+/** Dice coefficient over character pairs: 1 = same, 0 = nothing shared. */
+function similarity(a, b) {
+    if (!a || !b) return 0;
+    const A = bigrams(a), B = bigrams(b);
+    let shared = 0, total = 0;
+    for (const [g, n] of A) { shared += Math.min(n, B.get(g) ?? 0); total += n; }
+    for (const n of B.values()) total += n;
+    return total ? (2 * shared) / total : 0;
+}
+
+const ALIKE = 0.5;
+
+/** The biggest group of alike segments: how many, and the newest one as the example. */
+function biggestAlike(segs) {
+    let best = { count: 0, example: '' };
+    segs.forEach((a, i) => {
+        if (!a) return;
+        const count = segs.filter(b => b && similarity(a, b) >= ALIKE).length;
+        if (count >= best.count) best = { count, example: a };
+    });
+    return best;
+}
+
+const endsWithQuestion = t => /[?？]\s*$/.test(plainText(t).replace(/[)\]]+\s*$/, ''));
+
+/** What the recent replies keep doing, by kind: { count, example } (example only for alike segments). */
+function patternState() {
+    const s = settings();
+    const msgs = recentReplies(Math.max(2, Number(s.watchWindow) || DEFAULTS.watchWindow));
+    return {
+        total: msgs.length,
+        opening: biggestAlike(msgs.map(m => edgeOf(m.mes, 'start'))),
+        closing: biggestAlike(msgs.map(m => edgeOf(m.mes, 'end'))),
+        question: { count: msgs.filter(m => endsWithQuestion(m.mes)).length, example: '' },
+    };
+}
+
+const PATTERN_TEXT = {
+    opening: { label: 'ขึ้นต้นข้อความคล้ายกัน', prompt: ex => `หลายข้อความล่าสุดขึ้นต้นคล้ายกัน (เช่น "${ex}") ให้ขึ้นต้นข้อความถัดไปด้วยแบบอื่น เช่น บทพูด เสียง หรือสิ่งที่เกิดขึ้นรอบตัว` },
+    closing: { label: 'ลงท้ายข้อความคล้ายกัน', prompt: ex => `หลายข้อความล่าสุดลงท้ายคล้ายกัน (เช่น "${ex}") ให้จบข้อความถัดไปด้วยแบบอื่น` },
+    question: { label: 'จบข้อความด้วยคำถาม', prompt: () => 'หลายข้อความล่าสุดจบด้วยคำถาม ให้จบข้อความถัดไปด้วยการกระทำ บทพูด หรือภาพ ที่ไม่ใช่คำถาม' },
+};
+
+/** Instructions for the habits that are happening right now. */
+function patternLines(state) {
+    const s = settings();
+    const min = Math.max(2, Number(s.patternMin) || DEFAULTS.patternMin);
+    const lines = [];
+    for (const [k, t] of Object.entries(PATTERN_TEXT)) {
+        if (!s.patterns?.[k] || state[k].count < min) continue;
+        lines.push(t.prompt(state[k].example));
+    }
+    return lines;
+}
 
 // ---------------------------------------------------------------- prompt injection
+
+/** Rules whose prompt instruction applies to this model; "often" ones only while their phrase keeps turning up. */
+function promptRules(model, recent) {
+    return settings().rules.filter(r => r.enabled && r.prompt.trim() && modelMatches(r, model)
+        && (r.when !== 'often' || countHits(r, recent) >= r.minHits));
+}
 
 function updatePrompt() {
     const s = settings();
@@ -332,12 +477,15 @@ function updatePrompt() {
     let text = '';
     if (s.enabled && s.inject) {
         const model = currentModel();
-        const lines = s.rules
-            .filter(r => r.enabled && r.prompt.trim() && modelMatches(r, model))
-            .map(r => `- ${r.prompt.trim()}`);
+        const recent = recentReplies(Math.max(1, Number(s.watchWindow) || DEFAULTS.watchWindow));
+        const lines = [
+            ...promptRules(model, recent).map(r => r.prompt.trim()),
+            ...patternLines(patternState()),
+        ].map(l => `- ${l}`);
         if (lines.length) text = `${s.header}\n${lines.join('\n')}`;
     }
     c.setExtensionPrompt(PROMPT_KEY, text, IN_CHAT, Number(s.depth) || 0, false, Number(s.role) || 0);
+    syncModelLine();
 }
 
 // ---------------------------------------------------------------- review popup
@@ -382,7 +530,7 @@ async function reviewPopup(found, single) {
         <label class="sg_review_rule">
             <div class="sg_review_head">
                 <input type="checkbox" data-rule="${esc(g.rule.id)}" checked>
-                <code>${esc(g.rule.find)}</code>
+                <code>${esc(g.rule.name || g.rule.find)}</code>
                 <span class="sg_badge">${MODES[g.rule.mode].label} · ${g.count} ครั้ง${single ? '' : ` · ${g.messages} ข้อความ`}</span>
             </div>
             ${g.samples.map(x => `<div class="sg_sample">${x}</div>`).join('')}
@@ -435,6 +583,14 @@ async function handleReply(id) {
     const c = ctx();
     const msg = c.chat[id];
     if (!isBotMessage(msg)) return;
+    await editReply(id, msg);
+    await checkFlags(id);
+    updatePrompt();
+}
+
+async function editReply(id, msg) {
+    const s = settings();
+    const c = ctx();
     const text = msg.mes;
     let edits = planEdits(text, removalRules(), historyBefore(id));
     if (!edits.length) return;
@@ -459,6 +615,7 @@ async function handleReply(id) {
 
     const out = applyEdits(text, edits);
     if (out === text) return;
+    recordHits(msg, edits);
     writeMessage(id, out);
     await c.saveChat();
     if (s.mode === 'auto') toast.info(`แก้ ${edits.length} จุดในข้อความล่าสุด`);
@@ -486,11 +643,212 @@ async function cleanWholeChat() {
     let changed = 0;
     for (const f of found) {
         if (c.chat[f.id]?.mes !== f.text) continue;
-        const out = applyEdits(f.text, f.edits.filter(e => answer.ruleIds.has(e.rule.id)));
-        if (out !== f.text) { writeMessage(f.id, out); changed++; }
+        const edits = f.edits.filter(e => answer.ruleIds.has(e.rule.id));
+        const out = applyEdits(f.text, edits);
+        if (out !== f.text) { recordHits(c.chat[f.id], edits); writeMessage(f.id, out); changed++; }
     }
     if (changed) await c.saveChat();
     toast.ok(`แก้ไป ${changed} ข้อความ`);
+    updatePrompt();
+}
+
+// ---------------------------------------------------------------- flags: point out, rewrite by hand or by AI
+
+/** Matches of flag rules, without overlaps, in text order. */
+function findFlags(text) {
+    const hits = [];
+    for (const rule of flagRules()) {
+        const rx = compile(rule);
+        if (!rx) continue;
+        for (const m of text.matchAll(rx)) if (m[0]) hits.push({ rule, index: m.index, text: m[0] });
+    }
+    hits.sort((a, b) => a.index - b.index);
+    const out = [];
+    let end = -1;
+    for (const h of hits) {
+        if (h.index < end) continue;
+        out.push(h);
+        end = h.index + h.text.length;
+    }
+    return out;
+}
+
+function contextOf(text, h, pad = 60) {
+    const start = Math.max(0, h.index - pad);
+    const end = Math.min(text.length, h.index + h.text.length + pad);
+    return {
+        before: (start > 0 ? '…' : '') + text.slice(start, h.index).replace(/\s+/g, ' '),
+        after: text.slice(h.index + h.text.length, end).replace(/\s+/g, ' ') + (end < text.length ? '…' : ''),
+    };
+}
+
+/** After a new reply: if a flag rule matched, ask right away (ask mode) or leave a toast to tap. */
+async function checkFlags(id) {
+    const msg = ctx().chat[id];
+    if (!isBotMessage(msg)) return;
+    const hits = findFlags(msg.mes);
+    if (!hits.length) return;
+    if (settings().mode === 'ask') return flagPopup(id);
+    const what = [...new Set(hits.map(h => h.text))].slice(0, 3).join(', ');
+    globalThis.toastr?.warning(`เจอ ${hits.length} จุดที่ต้องเช็กในข้อความล่าสุด: ${esc(what)}<br>แตะเพื่อดูและแก้`, 'Slop Guard', {
+        timeOut: 15000, extendedTimeOut: 5000, closeButton: true, escapeHtml: false,
+        onclick: () => enqueue(() => flagPopup(id)),
+    });
+}
+
+const FIX_SYSTEM = `You fix fragments that slipped into Thai prose in the wrong language or script.
+For each item you get the sentence around it, with the fragment between ⟦ ⟧.
+Rewrite ONLY the fragment as natural Thai that fits the sentence and keeps its meaning. Keep proper names that are clearly meant to stay as they are.
+Return ONLY a JSON array of strings, one per item, in the same order.`;
+
+async function aiRewrite(text, hits) {
+    const items = hits.map((h, i) => { const x = contextOf(text, h); return `${i + 1}. ${x.before}⟦${h.text}⟧${x.after}`; });
+    const raw = await ctx().generateRaw({
+        systemPrompt: FIX_SYSTEM,
+        prompt: `${items.join('\n')}\n\nReturn the JSON array of ${hits.length} strings now.`,
+        responseLength: 600,
+    });
+    return parseStringList(raw);
+}
+
+/** Lists what the flag rules found in a reply; each spot can be rewritten by hand or by the model. */
+async function flagPopup(id) {
+    const c = ctx();
+    const msg = c.chat?.[id];
+    if (!isBotMessage(msg)) return;
+    const text = msg.mes;
+    const hits = findFlags(text);
+    if (!hits.length) return toast.ok('ไม่เจอจุดที่ต้องเช็กแล้ว');
+
+    const root = document.createElement('div');
+    root.className = 'sg_review';
+    root.innerHTML = `
+        <h3>เจอจุดที่ต้องเช็ก</h3>
+        <small class="sg_note">แก้ข้อความในช่องเป็นคำที่ถูก หรือกดให้ AI แก้ ช่องไหนไม่แก้จะคงไว้ตามเดิม</small>
+        <div class="sg_buttons"><div class="menu_button menu_button_icon sg_ai_fix"><i class="fa-solid fa-wand-magic-sparkles"></i> ให้ AI แก้ทุกจุด</div></div>
+        ${hits.map((h, i) => {
+            const x = contextOf(text, h);
+            return `
+        <div class="sg_review_rule" data-i="${i}">
+            <div class="sg_sample">${esc(x.before)}<mark>${esc(h.text)}</mark>${esc(x.after)}</div>
+            <div class="sg_review_head">
+                <span class="sg_badge sg_badge_left">${esc(h.rule.name || (h.rule.find.length > 24 ? h.rule.find.slice(0, 24) + '…' : h.rule.find))}</span>
+            </div>
+            <input type="text" class="text_pole sg_f_fix" value="${esc(h.text)}">
+        </div>`;
+        }).join('')}`;
+    const inputs = [...root.querySelectorAll('.sg_f_fix')];
+    const aiBtn = root.querySelector('.sg_ai_fix');
+    aiBtn.addEventListener('click', async () => {
+        if (aiBtn.classList.contains('disabled')) return;
+        aiBtn.classList.add('disabled');
+        try {
+            const out = await aiRewrite(text, hits);
+            if (!out.length) return toast.warn('AI ไม่ได้ตอบเป็นรายการ ลองอีกครั้ง');
+            out.slice(0, inputs.length).forEach((v, i) => { if (v.trim()) inputs[i].value = v.trim(); });
+        } catch (e) {
+            console.error(LOG, e);
+            toast.warn('ให้ AI แก้ไม่สำเร็จ: ' + (e?.message ?? e));
+        } finally {
+            aiBtn.classList.remove('disabled');
+        }
+    });
+    const result = await c.callGenericPopup(root, c.POPUP_TYPE.CONFIRM, '', {
+        okButton: 'แก้',
+        cancelButton: 'ปล่อยไว้',
+        wide: true,
+        allowVerticalScrolling: true,
+    });
+    if (result !== c.POPUP_RESULT.AFFIRMATIVE) return;
+    const edits = hits.map((h, i) => ({ ...h, after: inputs[i].value })).filter(e => e.after !== e.text);
+    if (!edits.length) return;
+    if (c.chat[id] !== msg || msg.mes !== text) return toast.warn('ข้อความเปลี่ยนไประหว่างรอ เลยไม่ได้แก้ให้');
+    recordHits(msg, edits);
+    writeMessage(id, applyEdits(text, edits));
+    await c.saveChat();
+    updatePrompt();
+    toast.ok(`แก้ ${edits.length} จุด`);
+}
+
+/** The last bot reply in the open chat, for /slopflag. */
+function lastBotId() {
+    const chat = ctx().chat ?? [];
+    for (let i = chat.length - 1; i >= 0; i--) if (isBotMessage(chat[i])) return i;
+    return -1;
+}
+
+// ---------------------------------------------------------------- ready-made rules
+
+const PRESETS = [
+    {
+        title: 'ไม่ใช่… แต่…',
+        desc: 'โครงสร้าง "ไม่ใช่ X แต่เป็น Y" ที่โมเดลชอบใช้ซ้ำ แจ้งโมเดลเฉพาะตอนเจอบ่อย',
+        rule: { find: '/ไม่ใช่[^\\n]{0,40}?(?:หากแต่|แต่)(?:เป็น|คือ)?/', mode: 'prompt', when: 'often', minHits: 2,
+            prompt: 'เลี่ยงโครงสร้าง "ไม่ใช่... แต่เป็น..." ให้บอกสิ่งที่เป็นไปตรงๆ' },
+    },
+    {
+        title: 'ราวกับ / เหมือนกับว่า',
+        desc: 'การเปรียบเทียบที่ถี่จนเฝือ แจ้งโมเดลเมื่อเจอเฉลี่ยเกินข้อความละครั้ง',
+        rule: { find: '/ราวกับ(?:ว่า)?|เหมือนกับว่า|ประหนึ่ง|ดุจดั่ง/', mode: 'prompt', when: 'often', minHits: 7,
+            prompt: 'ใช้การเปรียบเทียบด้วย "ราวกับ" ไม่เกินหนึ่งครั้งต่อข้อความ บรรยายสิ่งที่เห็นหรือรู้สึกตรงๆ แทน' },
+    },
+    {
+        title: 'ขีดยาว —',
+        desc: 'em dash ที่ภาษาไทยไม่ใช้ แทนด้วยเว้นวรรค',
+        rule: { find: '/[ \\t]*—+[ \\t]*/', mode: 'fix', replace: ' ' },
+    },
+    {
+        title: 'เครื่องหมายซ้ำ !! ??',
+        desc: 'ตกใจหรือถามซ้อนหลายตัว ให้เหลือตัวเดียว',
+        rule: { find: '/([!?！？])\\1+/', mode: 'fix', replace: '$1' },
+    },
+    {
+        title: 'อักษรต่างภาษาหลุด',
+        desc: 'อักษรจีน ญี่ปุ่น เกาหลี หรือรัสเซียโผล่กลางข้อความ แจ้งให้แก้เองหรือให้ AI แก้ อย่าใช้กับบอทที่ตั้งใจใช้อักษรพวกนี้',
+        rule: { find: '/[\\u3040-\\u30ff\\u3400-\\u4dbf\\u4e00-\\u9fff\\uf900-\\ufaff\\uac00-\\ud7af\\u0400-\\u04ff]+/', mode: 'flag', when: 'often', minHits: 1,
+            prompt: 'เขียนเป็นภาษาไทยทั้งหมด ห้ามมีอักษรภาษาอื่นปน' },
+    },
+    {
+        title: 'คำอังกฤษหลุดกลางประโยคไทย',
+        desc: 'คำอังกฤษที่อยู่ระหว่างคำไทย แจ้งให้แก้ ชื่อเฉพาะหรือศัพท์ที่ตั้งใจใช้จะโดนด้วย',
+        rule: { find: '/(?<=[\\u0E00-\\u0E7F][ \\t]?)[A-Za-z][A-Za-z\'’-]{2,}(?:[ \\t]+[A-Za-z][A-Za-z\'’-]*)*(?=[ \\t]?[\\u0E00-\\u0E7F])/', mode: 'flag' },
+    },
+];
+
+async function presetPopup() {
+    const c = ctx();
+    const s = settings();
+    const have = new Set(s.rules.map(r => r.find));
+    const root = document.createElement('div');
+    root.className = 'sg_review';
+    root.innerHTML = `
+        <h3>กฎสำเร็จรูป</h3>
+        <small class="sg_note">ติ๊กกฎที่จะเพิ่ม เพิ่มแล้วแก้ต่อได้ในรายการกฎ</small>
+        ${PRESETS.map((p, i) => {
+            const added = have.has(p.rule.find);
+            return `
+        <label class="sg_review_rule${added ? ' sg_off' : ''}">
+            <div class="sg_review_head">
+                <input type="checkbox" data-i="${i}"${added ? ' disabled' : ''}>
+                <b>${esc(p.title)}</b>
+                <span class="sg_badge">${added ? 'มีแล้ว' : MODES[p.rule.mode].label}</span>
+            </div>
+            <small class="sg_note">${esc(p.desc)}</small>
+        </label>`;
+        }).join('')}`;
+    const result = await c.callGenericPopup(root, c.POPUP_TYPE.CONFIRM, '', {
+        okButton: 'เพิ่ม',
+        cancelButton: 'ยกเลิก',
+        wide: true,
+        allowVerticalScrolling: true,
+    });
+    if (result !== c.POPUP_RESULT.AFFIRMATIVE) return;
+    const picked = [...root.querySelectorAll('input[data-i]:checked')].map(x => PRESETS[Number(x.dataset.i)]);
+    if (!picked.length) return;
+    for (const p of picked.reverse()) s.rules.unshift(makeRule({ name: p.title, ...p.rule }));
+    save();
+    renderRules();
+    toast.ok(`เพิ่ม ${picked.length} กฎ`);
 }
 
 // ---------------------------------------------------------------- AI scan
@@ -876,8 +1234,23 @@ function renderSettings() {
                 </div>
                 <small class="sg_note" id="sg_model_line"></small>
                 <hr class="sysHR">
+                <b class="sg_section">ตรวจรูปแบบซ้ำ</b>
+                <small class="sg_note">ถ้าข้อความล่าสุดทำแบบเดียวกันซ้ำ จะใส่คำเตือนใน prompt ให้เขียนต่างออกไป เฉพาะตอนที่เจอ</small>
+                <label class="checkbox_label"><input type="checkbox" id="sg_pat_opening"> ขึ้นต้นข้อความคล้ายกัน</label>
+                <label class="checkbox_label"><input type="checkbox" id="sg_pat_closing"> ลงท้ายข้อความคล้ายกัน</label>
+                <label class="checkbox_label"><input type="checkbox" id="sg_pat_question"> จบข้อความด้วยคำถาม</label>
+                <div class="sg_row">
+                    <label for="sg_pat_min">เตือนเมื่อเจอ</label>
+                    <input type="number" id="sg_pat_min" class="text_pole sg_num" min="2" max="20">
+                    <label for="sg_watch">ใน</label>
+                    <input type="number" id="sg_watch" class="text_pole sg_num" min="2" max="50">
+                    <span>ข้อความล่าสุด</span>
+                </div>
+                <small class="sg_note" id="sg_pattern_line"></small>
+                <hr class="sysHR">
                 <div class="sg_buttons">
                     <div class="menu_button menu_button_icon" id="sg_add"><i class="fa-solid fa-plus"></i> เพิ่มกฎ</div>
+                    <div class="menu_button menu_button_icon" id="sg_presets" title="กฎที่ใช้บ่อย เช่น ไม่ใช่…แต่… อักษรต่างภาษาหลุด"><i class="fa-solid fa-box-open"></i> กฎสำเร็จรูป</div>
                     <div class="menu_button menu_button_icon" id="sg_scan" title="ให้โมเดลที่ใช้อยู่หาวลีที่ซ้ำในแชทนี้"><i class="fa-solid fa-magnifying-glass"></i> สแกนแชทด้วย AI</div>
                     <div class="menu_button menu_button_icon" id="sg_clean" title="ใช้กฎกับทุกข้อความของบอทในแชทนี้"><i class="fa-solid fa-broom"></i> ล้างทั้งแชท</div>
                     <div class="menu_button menu_button_icon" id="sg_import"><i class="fa-solid fa-file-import"></i> นำเข้า</div>
@@ -890,7 +1263,7 @@ function renderSettings() {
                     <span>ข้อความ</span>
                     <label class="checkbox_label"><input type="checkbox" id="sg_scan_same"> เฉพาะที่โมเดลเดียวกันเขียน</label>
                 </div>
-                <small class="sg_note">แต่ละกฎเลือกวิธีจัดการเอง: <b>แก้คำผิด</b> ลบหรือแทนที่ทุกครั้ง · <b>หลากคำ</b> สุ่มคำจากคลังมาแทนเมื่อใช้ซ้ำ · <b>แค่ prompt</b> ไม่แก้ข้อความ · ช่อง "หา" ใส่วลีตรงๆ หรือ <code>/regex/</code> · การแก้ข้อความใช้กับทุกโมเดล ช่องโมเดลมีผลแค่กับกฎใน prompt</small>
+                <small class="sg_note">แต่ละกฎเลือกวิธีจัดการเอง: <b>แก้คำผิด</b> ลบหรือแทนที่ทุกครั้ง · <b>หลากคำ</b> สุ่มคำจากคลังมาแทนเมื่อใช้ซ้ำ · <b>แจ้งเตือน</b> ชี้จุดให้แก้เองหรือให้ AI แก้ · <b>แค่ prompt</b> ไม่แก้ข้อความ · ช่อง "หา" ใส่วลีตรงๆ หรือ <code>/regex/</code> · การแก้ข้อความใช้กับทุกโมเดล ช่องโมเดลมีผลแค่กับกฎใน prompt</small>
                 <div id="sg_rules" class="sg_rules"></div>
             </div>
         </div>
@@ -902,6 +1275,12 @@ function renderSettings() {
     bindCheck('sg_inject', 'inject');
     bindCheck('sg_scan_same', 'scanSameModel');
     $id('sg_ask').addEventListener('change', e => { s.mode = e.target.checked ? 'ask' : 'auto'; save(); });
+    for (const k of Object.keys(PATTERN_TEXT)) {
+        $id(`sg_pat_${k}`).addEventListener('change', e => { s.patterns = { ...s.patterns, [k]: e.target.checked }; save(); });
+    }
+    $id('sg_pat_min').addEventListener('change', e => { s.patternMin = Math.max(2, Number(e.target.value) || DEFAULTS.patternMin); e.target.value = String(s.patternMin); save(); });
+    $id('sg_watch').addEventListener('change', e => { s.watchWindow = Math.max(2, Number(e.target.value) || DEFAULTS.watchWindow); e.target.value = String(s.watchWindow); save(); renderRules(); });
+    $id('sg_presets').addEventListener('click', presetPopup);
     $id('sg_role').addEventListener('change', e => { s.role = Number(e.target.value); save(); });
     $id('sg_depth').addEventListener('change', e => { s.depth = Math.max(0, Number(e.target.value) || 0); save(); });
     $id('sg_scan_count').addEventListener('change', e => { s.scanCount = Math.max(5, Number(e.target.value) || 30); save(); });
@@ -934,6 +1313,9 @@ function syncSettingsUi() {
     $id('sg_inject').checked = !!s.inject;
     $id('sg_scan_same').checked = !!s.scanSameModel;
     $id('sg_ask').checked = s.mode === 'ask';
+    for (const k of Object.keys(PATTERN_TEXT)) $id(`sg_pat_${k}`).checked = !!s.patterns?.[k];
+    $id('sg_pat_min').value = String(s.patternMin);
+    $id('sg_watch').value = String(s.watchWindow);
     $id('sg_role').value = String(s.role);
     $id('sg_depth').value = String(s.depth);
     $id('sg_scan_count').value = String(s.scanCount);
@@ -944,11 +1326,26 @@ function syncSettingsUi() {
 function syncModelLine() {
     const el = $id('sg_model_line');
     if (!el) return;
+    const s = settings();
     const model = currentModel();
-    const active = settings().rules.filter(r => r.enabled && r.prompt.trim() && modelMatches(r, model)).length;
+    const recent = recentReplies(Math.max(1, Number(s.watchWindow) || DEFAULTS.watchWindow));
+    const mine = s.rules.filter(r => r.enabled && r.prompt.trim() && modelMatches(r, model));
+    const active = promptRules(model, recent).length;
+    const waiting = mine.length - active;
     el.textContent = model
-        ? `โมเดลตอนนี้: ${model} · กฎใน prompt ที่ใช้อยู่ ${active} ข้อ`
+        ? `โมเดลตอนนี้: ${model} · กฎใน prompt ที่ใส่อยู่ ${active} ข้อ${waiting ? ` (อีก ${waiting} ข้อรอให้เจอบ่อยก่อน)` : ''}`
         : 'ยังไม่ได้เชื่อมต่อโมเดล';
+
+    const pl = $id('sg_pattern_line');
+    if (!pl) return;
+    const st = patternState();
+    if (!st.total) { pl.textContent = 'ยังไม่มีข้อความของบอทในแชทนี้'; return; }
+    const min = Math.max(2, Number(s.patternMin) || DEFAULTS.patternMin);
+    pl.innerHTML = 'ตอนนี้: ' + Object.entries(PATTERN_TEXT).map(([k, t]) => {
+        const n = st[k].count;
+        const on = s.patterns?.[k] && n >= min;
+        return `<span class="${on ? 'sg_stale' : ''}">${t.label} ${n}/${st.total}${on ? ' ⚠' : ''}</span>`;
+    }).join(' · ');
 }
 
 /** Pools smaller than this let alternatives come back before the cooldown ends. */
@@ -977,6 +1374,7 @@ function renderRules() {
     }
     box.innerHTML = s.rules.map(r => `
         <div class="sg_rule sg_moded sg_mode_${r.mode}${r.enabled ? '' : ' sg_off'}" data-id="${esc(r.id)}">
+            ${r.name ? `<b class="sg_rule_name">${esc(r.name)}</b>` : ''}
             <div class="sg_rule_head">
                 <input type="checkbox" class="sg_f_enabled" title="เปิดใช้กฎนี้" ${r.enabled ? 'checked' : ''}>
                 <input type="text" class="text_pole sg_f_find${r.find.trim() && !compile(r) ? ' sg_invalid' : ''}" placeholder="หา: วลี หรือ /regex/" value="${esc(r.find)}">
@@ -997,6 +1395,11 @@ function renderRules() {
             <small class="sg_field_label">กฎใน prompt <span class="sg_optional">(ไม่ใส่ก็ได้)</span></small>
             <input type="text" class="text_pole sg_f_models" placeholder="โมเดลที่ได้กฎนี้ เช่น gemini (ว่าง = ทุกโมเดล)" value="${esc(r.models)}">
             <textarea class="text_pole sg_f_prompt" rows="2" placeholder="คำสั่งถึงโมเดล">${esc(r.prompt)}</textarea>
+            <div class="sg_row sg_when_row">
+                <label class="checkbox_label" title="ไม่ติ๊ก = ใส่ตลอด"><input type="checkbox" class="sg_f_often" ${r.when === 'often' ? 'checked' : ''}> ใส่เฉพาะตอนเจอบ่อย:</label>
+                <input type="number" class="text_pole sg_num sg_f_minhits" min="1" max="99" value="${r.minHits}">
+                <span>ครั้งขึ้นไป ใน ${Number(s.watchWindow) || DEFAULTS.watchWindow} ข้อความล่าสุด</span>
+            </div>
         </div>`).join('');
 
     for (const el of box.querySelectorAll('.sg_rule')) {
@@ -1023,6 +1426,12 @@ function renderRules() {
         field('.sg_f_prompt', 'prompt');
         field('.sg_f_pool', 'pool');
         field('.sg_f_allow', 'allowFirst', 'checked');
+        el.querySelector('.sg_f_often').addEventListener('change', e => { rule.when = e.target.checked ? 'often' : 'always'; save(); });
+        el.querySelector('.sg_f_minhits').addEventListener('change', e => {
+            rule.minHits = Math.max(1, Math.round(Number(e.target.value)) || 2);
+            e.target.value = String(rule.minHits);
+            save();
+        });
         bindModePicker(el, mode => {
             rule.mode = mode;
             el.querySelector('.sg_f_find').classList.toggle('sg_invalid', !!rule.find.trim() && !compile(rule));
@@ -1048,6 +1457,16 @@ function registerCommand() {
         name: 'slopclean',
         callback: async () => { await cleanWholeChat(); return ''; },
         helpString: 'Slop Guard — ใช้กฎกับทุกข้อความของบอทในแชทนี้ (แก้คำผิดและหลากคำ) โดยถามก่อน',
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'slopflag',
+        callback: async () => {
+            const id = lastBotId();
+            if (id < 0) toast.warn('ยังไม่มีข้อความของบอท');
+            else await flagPopup(id);
+            return '';
+        },
+        helpString: 'Slop Guard — ดูจุดที่กฎแบบแจ้งเตือนเจอในข้อความล่าสุดของบอท แล้วแก้เองหรือให้ AI แก้',
     }));
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'slopscan',
@@ -1142,7 +1561,8 @@ function start() {
     // Re-check the model right before every prompt is built: the model can be
     // switched from many places (connection profiles, slash commands, ...).
     eventSource.on(E.GENERATION_STARTED, () => updatePrompt());
-    eventSource.on(E.CHAT_CHANGED, () => { updatePrompt(); syncModelLine(); checkForNewVersion(); });
+    eventSource.on(E.CHAT_CHANGED, () => { updatePrompt(); checkForNewVersion(); });
+    for (const ev of [E.MESSAGE_EDITED, E.MESSAGE_DELETED, E.MESSAGE_SWIPED]) if (ev) eventSource.on(ev, () => updatePrompt());
     if (E.CHATCOMPLETION_MODEL_CHANGED) eventSource.on(E.CHATCOMPLETION_MODEL_CHANGED, () => { updatePrompt(); syncModelLine(); });
     if (E.ONLINE_STATUS_CHANGED) eventSource.on(E.ONLINE_STATUS_CHANGED, () => { updatePrompt(); syncModelLine(); });
     if (E.MAIN_API_CHANGED) eventSource.on(E.MAIN_API_CHANGED, () => { updatePrompt(); syncModelLine(); });
