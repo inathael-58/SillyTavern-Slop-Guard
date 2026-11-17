@@ -29,10 +29,12 @@
  * offers them as new rules; the model can also suggest alternatives for a pool.
  */
 
+import { installThemePalette } from './theme-palette.js';
+
 const MODULE = 'slop_guard';
 const PROMPT_KEY = 'slop_guard';
 const LOG = '[SlopGuard]';
-const VERSION = '1.3.0'; // keep in sync with manifest.json
+const VERSION = '1.3.1'; // keep in sync with manifest.json
 
 const IN_CHAT = 1; // extension_prompt_types.IN_CHAT
 
@@ -541,7 +543,7 @@ async function reviewPopup(found, single) {
         : null;
     const result = await c.callGenericPopup(root, c.POPUP_TYPE.CONFIRM, '', {
         okButton: 'แก้',
-        cancelButton: 'ข้าม',
+        cancelButton: 'ปล่อยไว้',
         customButtons,
         wide: true,
         allowVerticalScrolling: true,
@@ -1344,7 +1346,7 @@ function syncModelLine() {
     pl.innerHTML = 'ตอนนี้: ' + Object.entries(PATTERN_TEXT).map(([k, t]) => {
         const n = st[k].count;
         const on = s.patterns?.[k] && n >= min;
-        return `<span class="${on ? 'sg_stale' : ''}">${t.label} ${n}/${st.total}${on ? ' ⚠' : ''}</span>`;
+        return `<span class="${on ? 'sg_stale' : ''}">${t.label} ${n}/${st.total}${on ? ' <i class="fa-solid fa-triangle-exclamation"></i>' : ''}</span>`;
     }).join(' · ');
 }
 
@@ -1483,7 +1485,7 @@ function registerCommand() {
 
 const BASE_URL = new URL('.', import.meta.url);
 /** Every file of the extension, so a hard refresh can replace all of them in the browser cache. */
-const FILES = ['index.js', 'style.css', 'manifest.json'];
+const FILES = ['index.js', 'theme-palette.js', 'style.css', 'manifest.json'];
 let remoteVersion = '';
 let versionCheckedAt = 0;
 let versionToastShown = false;
@@ -1549,6 +1551,10 @@ function watchVersion() {
 
 function start() {
     settings();
+    // readable colors on every theme: state and diff colors keep their hue but contrast with the panel
+    try {
+        installThemePalette({ prefix: 'sg', colors: { del: '#e05555', ins: '#4caf7a', notice: '#f5a524' } });
+    } catch (err) { console.warn(LOG, 'theme palette', err); }
     renderSettings();
     watchVersion();
     registerCommand();

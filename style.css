@@ -1,5 +1,21 @@
 /* Slop Guard — uses SillyTavern theme variables so it follows any theme */
 
+/* One visual system. Shape lock: rule cards 8, mode buttons 6, highlights 3; nothing else.
+   Colors come from theme-palette.js (--sg-p-*, set on <html> once computed) and fall back to
+   the theme or the old values if it could not run. Text colors (del/ins/notice) keep their
+   hue but reach 4.5:1 on the panel; accent and outlines reach 3:1. */
+.sg_settings, .sg_review {
+    --sg-r-card: 8px;
+    --sg-r-ctl: 6px;
+    --sg-r-mark: 3px;
+    --sg-accent: var(--sg-p-accent, var(--SmartThemeQuoteColor, #4caf7a));
+    --sg-danger: var(--sg-p-danger, #e05555);
+    --sg-warn: var(--sg-p-warn, #f5a524);
+    --sg-del: var(--sg-p-del, #e05555);
+    --sg-ins: var(--sg-p-ins, #4caf7a);
+    --sg-notice: var(--sg-p-notice, #f5a524);
+}
+
 .sg_settings .sg_version { opacity: 0.6; font-weight: normal; }
 .sg_settings .sg_note,
 .sg_review .sg_note { display: block; opacity: 0.7; margin: 4px 0 8px; }
@@ -23,7 +39,7 @@
 
 .sg_rule {
     border: 1px solid var(--SmartThemeBorderColor, #555);
-    border-radius: 8px;
+    border-radius: var(--sg-r-card);
     padding: 6px 8px;
 }
 .sg_rule.sg_off { opacity: 0.5; }
@@ -34,7 +50,7 @@
 .sg_rule_head .sg_f_find,
 .sg_review_head .sg_f_find { flex: 1 1 auto; min-width: 0; margin: 0; }
 .sg_rule_head .sg_f_delete { width: auto; margin: 0; padding: 5px 8px; }
-.sg_invalid { outline: 1px solid #e05555; }
+.sg_invalid { outline: 1px solid var(--sg-danger); }
 
 /* Review / scan popups */
 .sg_review { text-align: left; }
@@ -42,7 +58,7 @@
 .sg_review_rule {
     display: block;
     border: 1px solid var(--SmartThemeBorderColor, #555);
-    border-radius: 8px;
+    border-radius: var(--sg-r-card);
     padding: 6px 8px;
     margin: 6px 0;
 }
@@ -62,11 +78,11 @@
     overflow-wrap: anywhere;
 }
 .sg_sample del {
-    color: #e05555;
+    color: var(--sg-del);
     text-decoration: line-through;
 }
 .sg_sample ins {
-    color: #4caf7a;
+    color: var(--sg-ins);
     text-decoration: underline;
 }
 
@@ -74,7 +90,7 @@
 .sg_verline { font-size: 0.9em; opacity: 0.85; margin: 2px 0 6px; }
 .sg_verbtns { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 .sg_verbtns .menu_button { width: auto; margin: 0; font-size: 0.95em; }
-.sg_stale { color: #f5a524; font-weight: 600; }
+.sg_stale { color: var(--sg-notice); font-weight: 600; }
 
 /* per-rule mode: fix / vary / prompt */
 .sg_modes { display: flex; gap: 4px; margin: 6px 0 2px; }
@@ -84,7 +100,7 @@
     position: relative;
     text-align: center;
     border: 1px solid var(--SmartThemeBorderColor, #555);
-    border-radius: 6px;
+    border-radius: var(--sg-r-ctl);
     padding: 4px 1px;
     cursor: pointer;
     opacity: 0.7;
@@ -96,8 +112,8 @@
 .sg_mode_opt.sg_sel {
     opacity: 1;
     font-weight: 600;
-    border-color: var(--SmartThemeQuoteColor, #4caf7a);
-    box-shadow: inset 0 0 0 1px var(--SmartThemeQuoteColor, #4caf7a);
+    border-color: var(--sg-accent);
+    box-shadow: inset 0 0 0 1px var(--sg-accent);
 }
 .sg_mode_desc { margin: 2px 0 4px; }
 .sg_moded:not(.sg_mode_fix) .sg_only_fix,
@@ -107,7 +123,7 @@
 .sg_moded > .sg_f_models { width: 100%; box-sizing: border-box; margin: 4px 0 0; }
 .sg_field_label { display: block; margin: 8px 0 0; opacity: 0.85; }
 .sg_optional { opacity: 0.7; }
-.sg_rule_hint { color: #f5a524; opacity: 0.95; margin: 2px 0; }
+.sg_rule_hint { color: var(--sg-notice); margin: 2px 0; }
 .sg_rule_hint[hidden] { display: none; }
 .sg_pool_row { justify-content: space-between; }
 .sg_pool_row .menu_button { width: auto; margin: 0; }
@@ -123,7 +139,7 @@
 .sg_when_row > span { flex: 1 1 0; min-width: 0; opacity: 0.85; }
 .sg_rule .sg_when_row .sg_num { flex: 0 0 52px; }
 .sg_section { display: block; margin: 2px 0; }
-.sg_review mark { background: rgba(245, 165, 36, 0.35); color: inherit; border-radius: 3px; padding: 0 1px; }
+.sg_review mark { background: color-mix(in srgb, var(--sg-warn) 35%, transparent); color: inherit; border-radius: var(--sg-r-mark); padding: 0 1px; }
 .sg_review .sg_f_fix { width: 100%; box-sizing: border-box; margin: 4px 0 0; }
 .sg_badge_left { margin-left: 0; }
 .sg_rule_name { display: block; margin: 0 0 4px; }
