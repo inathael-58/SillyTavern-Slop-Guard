@@ -34,7 +34,7 @@ import { installThemePalette } from './theme-palette.js';
 const MODULE = 'slop_guard';
 const PROMPT_KEY = 'slop_guard';
 const LOG = '[SlopGuard]';
-const VERSION = '1.3.2'; // keep in sync with manifest.json
+const VERSION = '1.3.3'; // keep in sync with manifest.json
 
 const IN_CHAT = 1; // extension_prompt_types.IN_CHAT
 
