@@ -143,3 +143,21 @@
 .sg_review .sg_f_fix { width: 100%; box-sizing: border-box; margin: 4px 0 0; }
 .sg_badge_left { margin-left: 0; }
 .sg_rule_name { display: block; margin: 0 0 4px; }
+
+/* inline error under the button that failed */
+.sg_err {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin: 0 0 8px;
+    padding: 6px 8px;
+    border-radius: var(--sg-r-ctl);
+    border-left: 3px solid var(--sg-danger);
+    background: color-mix(in srgb, var(--sg-danger) 10%, transparent);
+    overflow-wrap: anywhere;
+    text-align: left;
+}
+.sg_err > i { color: var(--sg-danger); margin-top: 0.2em; flex: 0 0 auto; }
+.sg_err_text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.sg_err_text small { opacity: 0.75; font-family: var(--monoFontFamily, monospace); font-size: 0.8em; }
+.sg_err .sg_err_close { flex: 0 0 auto; width: auto; margin: 0; padding: 3px 7px; }

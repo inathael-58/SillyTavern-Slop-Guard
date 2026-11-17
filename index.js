@@ -34,7 +34,7 @@ import { installThemePalette } from './theme-palette.js';
 const MODULE = 'slop_guard';
 const PROMPT_KEY = 'slop_guard';
 const LOG = '[SlopGuard]';
-const VERSION = '1.3.1'; // keep in sync with manifest.json
+const VERSION = '1.3.2'; // keep in sync with manifest.json
 
 const IN_CHAT = 1; // extension_prompt_types.IN_CHAT
 
@@ -95,6 +95,40 @@ const toast = {
     ok: m => globalThis.toastr?.success(m, 'Slop Guard'),
     warn: m => globalThis.toastr?.warning(m, 'Slop Guard'),
 };
+
+// ---------------------------------------------------------------- inline errors
+// A failed AI button shows its error right under the button that failed, with what to do
+// about it, and stays until it is closed or the button is pressed again. A toast vanishes,
+// and on a phone the user may not have seen which button it came from.
+
+/** What to do about an API error, read from its message. */
+function errorFix(message) {
+    const m = String(message ?? '');
+    if (/\b40[13]\b|unauthori[sz]ed|forbidden|api[ _-]?key|invalid.*key/i.test(m)) return 'API key ไม่ถูกต้องหรือหมดอายุ ตรวจในหน้า API Connections (ไอคอนปลั๊กด้านบน)';
+    if (/\b429\b|quota|rate.?limit|too many|exhausted/i.test(m)) return 'โควต้าหมดหรือส่งถี่เกินไป รอสักครู่ หรือเปลี่ยนไปใช้โมเดลอื่น';
+    if (/timeout|timed out|network|failed to fetch|abort|ECONN|50[0234]\b/i.test(m)) return 'ติดต่อ API ไม่ได้ ตรวจว่ายังเชื่อมต่ออยู่ (ไอคอนปลั๊กด้านบน) แล้วลองอีกครั้ง';
+    if (/safety|block|filter|refus/i.test(m)) return 'โมเดลปฏิเสธหรือติดตัวกรอง ลองอีกครั้ง หรือเปลี่ยนไปใช้โมเดลอื่น';
+    return 'ตรวจว่าเชื่อมต่อ API อยู่ (ไอคอนปลั๊กด้านบน) แล้วลองอีกครั้ง';
+}
+
+/** Shows an error under `anchor` (the row holding the button). `detail` is the raw API text, if any. */
+function showError(anchor, what, { detail = '', fix = '' } = {}) {
+    if (!anchor) return;
+    clearError(anchor);
+    const box = document.createElement('div');
+    box.className = 'sg_err';
+    box.setAttribute('role', 'alert');
+    box.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i>
+        <div class="sg_err_text"><b>${esc(what)}</b>${fix ? `<div>${esc(fix)}</div>` : ''}${detail ? `<small>${esc(detail)}</small>` : ''}</div>
+        <div class="menu_button fa-solid fa-xmark sg_err_close" title="ปิด"></div>`;
+    box.querySelector('.sg_err_close').addEventListener('click', () => box.remove());
+    anchor.after(box);
+}
+function clearError(anchor) {
+    const next = anchor?.nextElementSibling;
+    if (next?.classList.contains('sg_err')) next.remove();
+}
+
 
 /** How a rule handles its phrase in a reply. */
 const MODES = {
@@ -743,14 +777,17 @@ async function flagPopup(id) {
     const aiBtn = root.querySelector('.sg_ai_fix');
     aiBtn.addEventListener('click', async () => {
         if (aiBtn.classList.contains('disabled')) return;
+        const row = aiBtn.parentElement;
+        clearError(row);
         aiBtn.classList.add('disabled');
         try {
             const out = await aiRewrite(text, hits);
-            if (!out.length) return toast.warn('AI ไม่ได้ตอบเป็นรายการ ลองอีกครั้ง');
+            if (!out.length) return showError(row, 'AI ไม่ได้ตอบเป็นรายการ', { fix: 'กดอีกครั้ง หรือแก้คำในช่องเอง' });
             out.slice(0, inputs.length).forEach((v, i) => { if (v.trim()) inputs[i].value = v.trim(); });
         } catch (e) {
             console.error(LOG, e);
-            toast.warn('ให้ AI แก้ไม่สำเร็จ: ' + (e?.message ?? e));
+            const detail = String(e?.message ?? e);
+            showError(row, 'ให้ AI แก้ไม่สำเร็จ', { fix: errorFix(detail), detail });
         } finally {
             aiBtn.classList.remove('disabled');
         }
@@ -891,7 +928,9 @@ async function scanWithAI() {
     if (scanning) return;
     const c = ctx();
     const s = settings();
-    if (!c.chat?.length) return toast.warn('ยังไม่ได้เปิดแชท');
+    const row = $id('sg_scan')?.parentElement;
+    clearError(row);
+    if (!c.chat?.length) return showError(row, 'ยังไม่ได้เปิดแชท', { fix: 'เปิดแชทที่อยากสแกนก่อน แล้วกดอีกครั้ง' });
 
     const model = currentModel();
     const family = modelFamily(model);
@@ -903,7 +942,7 @@ async function scanWithAI() {
     msgs = msgs.slice(-Math.max(5, Number(s.scanCount) || 30));
     let corpus = msgs.map(m => stripForScan(m.mes)).filter(Boolean).join('\n\n---\n\n');
     if (corpus.length > 60000) corpus = corpus.slice(-60000);
-    if (corpus.length < 500) return toast.warn('ข้อความในแชทยังน้อยเกินไปสำหรับการสแกน');
+    if (corpus.length < 500) return showError(row, 'ข้อความของบอทในแชทนี้ยังน้อยเกินไปสำหรับการสแกน', { fix: 'คุยต่ออีกสักพัก หรือเพิ่ม "สแกนย้อนหลัง" ด้านล่าง' });
 
     scanning = true;
     const btn = $id('sg_scan');
@@ -918,7 +957,9 @@ async function scanWithAI() {
         });
     } catch (e) {
         console.error(LOG, e);
-        toast.warn('สแกนไม่สำเร็จ: ' + (e?.message ?? e));
+        const detail = String(e?.message ?? e);
+        showError(row, 'สแกนไม่สำเร็จ', { fix: errorFix(detail), detail });
+        toast.warn('สแกนไม่สำเร็จ ดูรายละเอียดใต้ปุ่มสแกน');
         return;
     } finally {
         scanning = false;
@@ -1054,12 +1095,14 @@ const suggesting = new Set(); // rule ids with a request in flight
 /** Asks the current model for alternatives to a rule's phrase and lets the user pick which go into its pool. */
 async function suggestPool(rule, button) {
     if (suggesting.has(rule.id)) return;
-    if (!rule.find.trim()) return toast.warn('ใส่คำในช่อง "หา" ก่อน');
+    const row = button?.parentElement;
+    clearError(row);
+    if (!rule.find.trim()) return showError(row, 'ยังไม่มีคำในช่อง "หา"', { fix: 'ใส่วลีที่อยากหาคำแทนก่อน แล้วกดอีกครั้ง' });
     const c = ctx();
     const isRegex = /^\/[\s\S]+\/[dgimsuvy]*$/.test(rule.find);
     const samples = sampleContexts(rule);
     const phrase = (samples[0]?.match ?? rule.find).trim();
-    if (isRegex && !samples.length) return toast.warn('กฎนี้เป็น regex และยังไม่เจอในแชทนี้ เลยไม่รู้ว่าคำจริงคืออะไร ลองเปิดแชทที่มีคำนี้ก่อน');
+    if (isRegex && !samples.length) return showError(row, 'กฎนี้เป็น regex และยังไม่เจอในแชทนี้ เลยไม่รู้ว่าคำจริงคืออะไร', { fix: 'เปิดแชทที่มีคำนี้ก่อน แล้วกดอีกครั้ง' });
 
     const lines = [`Phrase: "${phrase}"`];
     if (isRegex) lines.push(`(It is one match of the pattern ${rule.find}; alternatives replace the whole match.)`);
@@ -1079,7 +1122,8 @@ async function suggestPool(rule, button) {
         raw = await c.generateRaw({ systemPrompt: POOL_SYSTEM, prompt: lines.join('\n'), responseLength: 800 });
     } catch (e) {
         console.error(LOG, e);
-        return toast.warn('ขอคำจาก AI ไม่สำเร็จ: ' + (e?.message ?? e));
+        const detail = String(e?.message ?? e);
+        return showError(row, 'ขอคำจาก AI ไม่สำเร็จ', { fix: errorFix(detail), detail });
     } finally {
         suggesting.delete(rule.id);
         button?.classList.remove('disabled');
@@ -1089,7 +1133,7 @@ async function suggestPool(rule, button) {
 
     const known = new Set([phrase, ...rule.pool].map(x => x.toLowerCase()));
     const list = parsePool(parseStringList(raw)).filter(x => !known.has(x.toLowerCase()));
-    if (!list.length) return toast.warn('AI ไม่ได้เสนอคำใหม่ ลองกดอีกครั้ง');
+    if (!list.length) return showError(row, 'AI ไม่ได้เสนอคำใหม่', { fix: 'กดอีกครั้ง หรือพิมพ์คำลงคลังเอง' });
     await pickPoolSuggestions(rule, list, samples[0] ?? null);
 }
 
